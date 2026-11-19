@@ -115,7 +115,6 @@ interface Props {
     onPrepare: (prefill: WizardPrefill) => void;
     onStarted: (session: SessionResponse) => void;
     onViewAll: () => void;
-    onOpenSession: (sessionId: string) => void;
   };
 }
 
