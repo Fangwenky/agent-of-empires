@@ -2435,6 +2435,7 @@ function AppContent({
             }}
             onOpenSession={(id) => requestNavigate(`/session/${encodeURIComponent(id)}`)}
             onOpenSettings={() => requestNavigate("/settings/suggestions")}
+            sessions={sessions}
             canLink={!caps.nameOnlyWizard}
             onEditPreset={(providerId, criterion) =>
               requestNavigate(
