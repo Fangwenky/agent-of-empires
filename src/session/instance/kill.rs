@@ -630,8 +630,14 @@ mod tests {
             before_start_hook_env: Vec::new(),
             container_workdir: None,
         });
-        for (name, tail) in [("stops", "echo 'survived 0'"), ("fails", "exit 1")] {
-            inst.active_execution = Some(ActiveExecution {
+        // A launch with no execution is stopped by the id it recorded, the same as one with.
+        for (record, name, tail) in [
+            ("execution", "stops", "echo 'survived 0'"),
+            ("sandbox_launch", "recorded", "echo 'survived 0'"),
+            ("execution", "fails", "exit 1"),
+        ] {
+            let _ = std::fs::remove_file(bin.path().join("argv"));
+            let execution = ActiveExecution {
                 launch_id: "launch-2".into(),
                 binding: crate::session::ExecutionBinding {
                     agent: "claude".into(),
@@ -648,7 +654,17 @@ mod tests {
                     name,
                     tail,
                 )),
-            });
+            };
+            (inst.active_execution, inst.sandbox_launch) = match record {
+                "execution" => (Some(execution), None),
+                _ => (
+                    None,
+                    Some(super::super::SandboxLaunch {
+                        launch_id: execution.launch_id,
+                        container: execution.container.unwrap(),
+                    }),
+                ),
+            };
             inst.kill_for_restart(None).unwrap();
             let argv = crate::containers::process_census::recorded_argv(bin.path());
             assert_eq!(
@@ -675,6 +691,12 @@ mod tests {
         crate::session::background_processes::stop_container_launch(&inst, &confirmed).unwrap_err();
         let argv = crate::containers::process_census::recorded_argv(bin.path());
         assert_eq!(argv[6..], ["launch-2", "/proc", "124:1240"]);
+
+        // An unmarked launch has nothing to stop by: no exec into the container at all.
+        std::fs::remove_file(bin.path().join("argv")).unwrap();
+        (inst.active_execution, inst.sandbox_launch) = (None, None);
+        inst.kill_for_restart(None).unwrap();
+        assert!(!bin.path().join("argv").exists());
     }
     #[cfg(target_os = "linux")]
     #[test]

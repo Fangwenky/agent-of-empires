@@ -106,13 +106,16 @@ pub(crate) fn stop_container_launch(
     })
 }
 
-/// The launch id the Session's container processes carry, and where the container runs. A
-/// launch without a native execution exports no id and records none, so it has none here.
+/// The launch id the Session's container processes carry, and where the container runs: the
+/// execution's, else the record a launch with no execution left. A row with neither is unmarked.
 fn marked_launch(
     instance: &Instance,
 ) -> Option<(&str, &crate::containers::ContainerExecutionSnapshot)> {
-    let active = instance.active_execution.as_ref()?;
-    Some((active.launch_id.as_str(), active.container.as_ref()?))
+    match (&instance.active_execution, &instance.sandbox_launch) {
+        (Some(active), _) => Some((active.launch_id.as_str(), active.container.as_ref()?)),
+        (None, Some(launch)) => Some((launch.launch_id.as_str(), &launch.container)),
+        (None, None) => None,
+    }
 }
 
 /// What a restart would stop or leave in a container besides the Agent, from the launch
@@ -1335,14 +1338,76 @@ mod tests {
         assert!(size <= 8 * 1024, "{size}");
     }
 
-    /// A sandboxed launch that recorded no execution carries no launch id, so its container
-    /// can't be read for it: the census refuses rather than reading the container as empty.
+    /// The census reads the container by the launch's execution, else by the record a launch with
+    /// no execution left; a row with neither is refused rather than read as empty.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn a_sandboxed_launch_without_an_execution_is_unclassified() {
-        let mut row = Instance::new("sandboxed", "/tmp/aoe-census-no-execution");
-        row.tool = "claude".into();
-        assert!(row.active_execution.is_none());
-        assert_eq!(container_census_of(&row), PaneCensus::Unclassified);
+    fn a_sandboxed_census_reads_the_launch_s_execution_else_its_record() {
+        use crate::containers::process_census::{fake_container, recorded_argv, CENSUS_SCRIPT};
+        let bin = tempfile::tempdir().unwrap();
+        let container = || fake_container(bin.path(), "docker", "exit 1");
+        let execution = crate::session::instance::ActiveExecution {
+            launch_id: "execution-launch".into(),
+            binding: crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: "/workspace".into(),
+                cwd_filesystem: "container".into(),
+                filesystem: "container".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: Some(container()),
+        };
+        let record = crate::session::instance::SandboxLaunch {
+            launch_id: "recorded-launch".into(),
+            container: container(),
+        };
+        for (case, active, sandbox, read) in [
+            ("neither", None, None, None),
+            (
+                "record",
+                None,
+                Some(record.clone()),
+                Some("recorded-launch"),
+            ),
+            (
+                "both",
+                Some(execution),
+                Some(record),
+                Some("execution-launch"),
+            ),
+        ] {
+            let _ = std::fs::remove_file(bin.path().join("argv"));
+            let mut row = Instance::new("sandboxed", "/tmp/aoe-census-record");
+            row.tool = "claude".into();
+            (row.active_execution, row.sandbox_launch) = (active, sandbox);
+            assert_eq!(
+                container_census_of(&row),
+                PaneCensus::Unclassified,
+                "{case}"
+            );
+            let argv = bin
+                .path()
+                .join("argv")
+                .exists()
+                .then(|| recorded_argv(bin.path()));
+            let want = read.map(|launch| {
+                [
+                    "exec",
+                    "container-id",
+                    "/bin/sh",
+                    "-c",
+                    CENSUS_SCRIPT,
+                    "sh",
+                    launch,
+                ]
+                .map(String::from)
+                .to_vec()
+            });
+            assert_eq!(argv, want, "{case}");
+        }
     }
 
     /// Katie's probe (2026-11-23): a container where the restart's pane kill would leave the
