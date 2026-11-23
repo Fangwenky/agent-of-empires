@@ -68,7 +68,7 @@ fn container_census_of(instance: &Instance) -> PaneCensus {
     match crate::containers::process_census::read(container, launch_id) {
         Ok(processes) => container_census(&processes, &container.id, agent.binary),
         Err(error) => {
-            tracing::warn!(session = %instance.id, %error, "container census failed");
+            tracing::warn!(target: "session.lifecycle", session = %instance.id, %error, "container census failed");
             PaneCensus::Unclassified
         }
     }
