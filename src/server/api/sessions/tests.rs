@@ -10592,16 +10592,159 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     assert_eq!(sleeping(6), 6, "the replaced pane was not stopped");
     assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
 
-    // The replacement's shells are new, so they are listed first; accepting an unclassified
-    // check then lets the same replacement go ahead at the stop, and the hooks still ran once.
-    let (status, relisted) = confirm(identities(&boundary), true, false).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{relisted}");
-    assert_eq!(relisted["total"], 6);
+    // The replacement's shells are new, so they are listed first. Accepting an unclassified
+    // check accepts the checked pane's processes, not a replacement's, so it is still refused.
+    let confirm_ref = &confirm;
+    let relist = move |previous: serde_json::Value| async move {
+        let (status, relisted) = confirm_ref(identities(&previous), true, false).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{relisted}");
+        assert_eq!(relisted["total"], 6);
+        relisted
+    };
+    let relisted = relist(boundary.clone()).await;
     let replaced = replace_before_stop();
-    let (status, confirmed) = confirm(identities(&relisted), true, true).await;
+    let (status, accepted) = confirm(identities(&relisted), true, true).await;
     drop(replaced);
-    assert!(status.is_success(), "{status} {confirmed}");
+    assert_eq!(status, StatusCode::CONFLICT, "{accepted}");
+    assert_eq!(accepted["classified"], false);
+    assert_eq!(sleeping(6), 6, "an accepted check stopped no replacement");
+
+    // The stop repeats the check by pane and session id inside the kill, so a pane respawned,
+    // or a session recreated under the same name, after the outer check is not stopped either.
+    // Killing the only session exits the server, and the next one can reuse `$0`, so a recreate
+    // shows as a new server or a new session id.
+    let session_id = || {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("={pane}:"),
+                "#{pid} #{session_id}",
+            ])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let in_kill = |recreate: bool| {
+        let pane = pane.clone();
+        let agent = agent.to_str().unwrap().to_owned();
+        crate::session::background_processes::BoundaryHook::arm(&pane.clone(), move |at| {
+            if at != crate::session::background_processes::Boundary::InKill {
+                return;
+            }
+            let replaced = if recreate {
+                crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &format!("={pane}")])
+                    .status()
+                    .unwrap();
+                crate::tmux::tmux_command()
+                    .args(["new-session", "-d", "-s", &pane, &agent])
+                    .status()
+                    .unwrap()
+            } else {
+                crate::tmux::tmux_command()
+                    .args(["respawn-pane", "-k", "-t", &pane, &agent])
+                    .status()
+                    .unwrap()
+            };
+            assert!(replaced.success());
+            assert_eq!(sleeping_in(&pane, 6), 6);
+        })
+    };
+    let mut previous = accepted;
+    for recreate in [false, true] {
+        let relisted = relist(previous).await;
+        let (old_pid, old_session) = (pane_pid(&pane), session_id());
+        let replaced = in_kill(recreate);
+        let (status, refused) = confirm(identities(&relisted), true, true).await;
+        drop(replaced);
+        assert_ne!(
+            pane_pid(&pane),
+            old_pid,
+            "recreate {recreate}: the pane was replaced"
+        );
+        assert_eq!(session_id() != old_session, recreate, "recreate {recreate}");
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "recreate {recreate}: {refused}"
+        );
+        assert_eq!(refused["classified"], false);
+        assert_eq!(
+            sleeping(6),
+            6,
+            "recreate {recreate}: the replacement was not stopped"
+        );
+        assert!(storage.load().unwrap()[0].lifecycle_reservation.is_none());
+        previous = relisted;
+    }
     assert_eq!(hook_runs(), 1, "on_launch ran once for the whole restart");
+
+    // A pane moved into another session keeps its root and its pane id, so only the session id
+    // tells it from the checked one. Neither its processes nor the checked session's other
+    // window, which no check read, is stopped.
+    let tmux_out = |args: &[&str]| {
+        let output = crate::tmux::tmux_command().args(args).output().unwrap();
+        assert!(output.status.success(), "{args:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let checked_session = format!("={pane}:");
+    let pane_id = tmux_out(&[
+        "display-message",
+        "-p",
+        "-t",
+        &checked_session,
+        "#{pane_id}",
+    ]);
+    tmux_out(&["new-window", "-d", "-t", &checked_session]);
+    let moved_to = format!("{pane}-moved");
+    let relisted = relist(previous).await;
+    let moved = {
+        let (pane_id, moved_to) = (pane_id.clone(), moved_to.clone());
+        crate::session::background_processes::BoundaryHook::arm(&pane.clone(), move |at| {
+            if at != crate::session::background_processes::Boundary::InKill {
+                return;
+            }
+            for args in [
+                vec!["new-session", "-d", "-s", moved_to.as_str()],
+                vec![
+                    "join-pane",
+                    "-s",
+                    pane_id.as_str(),
+                    "-t",
+                    &format!("={moved_to}:"),
+                ],
+            ] {
+                assert!(crate::tmux::tmux_command()
+                    .args(&args)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+        })
+    };
+    let (status, refused) = confirm(identities(&relisted), true, true).await;
+    drop(moved);
+    assert_eq!(status, StatusCode::CONFLICT, "moved: {refused}");
+    assert_eq!(refused["classified"], false);
+    assert_eq!(
+        sleeping_in(&pane_id, 6),
+        6,
+        "the moved pane was not stopped"
+    );
+    assert_eq!(
+        tmux_out(&[
+            "display-message",
+            "-p",
+            "-t",
+            &checked_session,
+            "#{session_windows}"
+        ]),
+        "1",
+        "the checked session's other window was not stopped"
+    );
+    tmux_out(&["kill-session", "-t", &format!("={moved_to}")]);
 
     // Accepting an unclassified check lets the restart go ahead.
     let mut unrecorded = unrecorded;

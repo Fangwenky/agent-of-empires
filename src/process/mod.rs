@@ -2259,6 +2259,38 @@ pub fn kill_process_tree(pid: u32) {
     }
 }
 
+/// [`kill_process_tree`] from `root` checked by identity: `Ok(false)`, with nothing signalled,
+/// when `root` is no longer that process. The root is signalled through its handle, so a reused
+/// PID can't take the signal; its descendants are walked and signalled by PID.
+pub(crate) fn kill_checked_process_tree(root: &PrimeProcessIdentity) -> anyhow::Result<bool> {
+    let Some(handle) = platform::ProcessHandle::capture(root)? else {
+        return Ok(false);
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let descendants: Vec<u32> = platform::collect_pid_tree(root.pid)
+            .into_iter()
+            .skip(1)
+            .collect();
+        for &p in descendants.iter().rev() {
+            let _ = kill(Pid::from_raw(p as i32), Signal::SIGTERM);
+        }
+        handle.signal(libc::SIGTERM)?;
+        std::thread::sleep(Duration::from_millis(100));
+        for &p in descendants.iter().rev() {
+            if process_exists(p) {
+                let _ = kill(Pid::from_raw(p as i32), Signal::SIGKILL);
+            }
+        }
+        if !handle.exited()? {
+            handle.signal(libc::SIGKILL)?;
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = handle;
+    Ok(true)
+}
+
 /// SIGTERM every pid in reverse order (children first), wait briefly for
 /// graceful shutdown, then SIGKILL anything still alive.
 #[cfg(any(target_os = "linux", target_os = "macos"))]

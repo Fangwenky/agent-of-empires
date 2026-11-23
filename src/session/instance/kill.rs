@@ -163,7 +163,9 @@ impl Instance {
         &self,
         recheck: Option<&crate::session::background_processes::ProcessRecheck>,
     ) -> Result<()> {
-        use crate::session::background_processes::{final_census, pane_still_checked};
+        use crate::session::background_processes::{
+            final_census, pane_replaced, pane_still_checked,
+        };
         use crate::tmux::utils::{probe_pane, PaneProbe};
         self.capture_poller.stop();
         let checked = match recheck {
@@ -178,13 +180,18 @@ impl Instance {
                     session.name()
                 ),
                 PaneProbe::Alive => {
-                    if let Some((recheck, root)) = &checked {
+                    if let Some((_, root)) = &checked {
                         #[cfg(test)]
                         crate::session::background_processes::BoundaryHook::fire(
                             self,
                             crate::session::background_processes::Boundary::BeforeStop,
                         );
-                        pane_still_checked(&session, root.as_ref(), recheck)?;
+                        let pane = pane_still_checked(&session, root.as_ref())?;
+                        if !session.kill_checked(&pane)? {
+                            return Err(pane_replaced().into());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        return Ok(());
                     }
                 }
                 PaneProbe::Dead => {

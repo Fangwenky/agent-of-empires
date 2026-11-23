@@ -14,6 +14,7 @@ use super::{
 };
 use crate::cli::truncate_id;
 use crate::process;
+use crate::process::PrimeProcessIdentity;
 use crate::session::environment::shell_escape_script_word;
 use crate::session::Status;
 use crate::util::now_ms;
@@ -328,6 +329,41 @@ fn chrome_rows(window_height: u16, pane_height: u16) -> u16 {
 /// A `capture-pane` result: its output, or `None` when tmux reported failure.
 fn capture_output(success: bool, stdout: &[u8]) -> Option<String> {
     success.then(|| String::from_utf8_lossy(stdout).into_owned())
+}
+
+/// The pane a restart's census checked: `$N` with its creation time, since session ids restart
+/// at `$0` with the server, `%N`, and the pane's root process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckedPane {
+    session_id: String,
+    session_created: String,
+    pane_id: String,
+    pub(crate) root: PrimeProcessIdentity,
+}
+
+/// A live pane's session id, session creation time and root PID, in one query.
+fn pane_binding(pane_id: &str) -> Option<(String, String, u32)> {
+    let output = crate::tmux::tmux_query_command()
+        .args([
+            "display-message",
+            "-t",
+            pane_id,
+            "-p",
+            "#{session_id}\t#{session_created}\t#{pane_dead}\t#{pane_pid}",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut fields = text.trim_end().split('\t');
+    let (session_id, created) = (fields.next()?, fields.next()?);
+    let pid = match (fields.next()?, fields.next()?, fields.next()) {
+        ("0", pid, None) => pid.parse::<u32>().ok().filter(|pid| *pid > 0)?,
+        _ => return None,
+    };
+    Some((session_id.to_owned(), created.to_owned(), pid))
 }
 
 impl Session {
@@ -664,6 +700,62 @@ impl Session {
         refresh_session_cache();
 
         Ok(())
+    }
+
+    /// The live first pane as a restart's census checks it: the pane, its session and its root
+    /// process, read from the pane itself. `None` when tmux doesn't answer or the pane is dead.
+    pub(crate) fn checked_pane(&self) -> Option<CheckedPane> {
+        let pane_id = super::first_pane_id(&self.name)?;
+        let (session_id, session_created, pid) = pane_binding(&pane_id)?;
+        let root = process::process_identity(pid).ok().flatten()?;
+        Some(CheckedPane {
+            session_id,
+            session_created,
+            pane_id,
+            root,
+        })
+    }
+
+    /// [`Session::kill`] bound to `checked`: `Ok(false)`, with nothing touched, unless the pane,
+    /// its session and its root process are still the ones checked. Then the pane is retained by
+    /// id, the tree signalled from the checked root, and the session closed by id, so nothing a
+    /// replacement could take over by name is stopped.
+    pub(crate) fn kill_checked(&self, checked: &CheckedPane) -> Result<bool> {
+        #[cfg(test)]
+        crate::session::background_processes::BoundaryHook::fire_named(
+            &self.name,
+            crate::session::background_processes::Boundary::InKill,
+        );
+        let same = pane_binding(&checked.pane_id).is_some_and(|(session_id, created, pid)| {
+            session_id == checked.session_id
+                && created == checked.session_created
+                && pid == checked.root.pid
+        });
+        if !same || process::process_identity(checked.root.pid)?.as_ref() != Some(&checked.root) {
+            return Ok(false);
+        }
+        let output = crate::tmux::tmux_query_command()
+            .args([
+                "set-option",
+                "-p",
+                "-t",
+                &checked.pane_id,
+                "remain-on-exit",
+                "on",
+            ])
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "Failed to retain tmux pane for teardown: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        if !process::kill_checked_process_tree(&checked.root)? {
+            return Ok(false);
+        }
+        super::utils::kill_session_by_id(&checked.session_id)?;
+        refresh_session_cache();
+        Ok(true)
     }
 
     pub fn rename(&self, new_name: &str) -> Result<()> {

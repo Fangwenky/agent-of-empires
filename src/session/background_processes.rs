@@ -55,24 +55,24 @@ pub(crate) fn final_census(
     }
 }
 
-/// Whether the live pane about to be stopped is the one [`final_census`] read (`None` when it
-/// found no pane). Any other pane was never checked, so it refuses as unclassified unless that
-/// was accepted.
+/// The live pane about to be stopped, when it is the one [`final_census`] read (`root` is
+/// `None` when it found none). Any other pane was never checked, so it refuses as unclassified
+/// even when that was accepted: the caller accepted the checked pane's processes, not another's.
 pub(crate) fn pane_still_checked(
     session: &crate::tmux::Session,
     root: Option<&PrimeProcessIdentity>,
-    recheck: &ProcessRecheck,
-) -> Result<(), BackgroundProcessesAppeared> {
-    let current = session
-        .get_pane_pid()
-        .and_then(|pid| crate::process::process_identity(pid).ok().flatten());
-    if current.is_some() && current.as_ref() == root {
-        return Ok(());
-    }
-    match refusal(PaneCensus::Unclassified, &[], recheck.stop_unclassified) {
-        Some(fields) => Err(BackgroundProcessesAppeared(fields)),
-        None => Ok(()),
-    }
+) -> Result<crate::tmux::CheckedPane, BackgroundProcessesAppeared> {
+    session
+        .checked_pane()
+        .filter(|pane| Some(&pane.root) == root)
+        .ok_or_else(pane_replaced)
+}
+
+/// The refusal for a pane or session other than the one checked.
+pub(crate) fn pane_replaced() -> BackgroundProcessesAppeared {
+    BackgroundProcessesAppeared(
+        refusal(PaneCensus::Unclassified, &[], false).expect("unclassified refuses"),
+    )
 }
 
 /// Test-only: where a restart's teardown runs a [`BoundaryHook`].
@@ -83,6 +83,8 @@ pub(crate) enum Boundary {
     Teardown,
     /// After the final census, just before the pane is killed.
     BeforeStop,
+    /// Inside the stop, after the outer pane check, before it is repeated and anything signalled.
+    InKill,
 }
 
 #[cfg(test)]
@@ -110,14 +112,17 @@ impl BoundaryHook {
     }
 
     pub(crate) fn fire(instance: &Instance, at: Boundary) {
-        let Ok(session) = instance.tmux_session() else {
-            return;
-        };
+        if let Ok(session) = instance.tmux_session() {
+            Self::fire_named(session.name(), at);
+        }
+    }
+
+    pub(crate) fn fire_named(session_name: &str, at: Boundary) {
         let callbacks: Vec<_> = BOUNDARY_HOOKS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .filter(|(name, _)| name == session.name())
+            .filter(|(name, _)| name == session_name)
             .map(|(_, callback)| callback.clone())
             .collect();
         for callback in callbacks {

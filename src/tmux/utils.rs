@@ -609,6 +609,22 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Closes the session with tmux id `$N`; one already gone is not an error.
+pub(crate) fn kill_session_by_id(session_id: &str) -> Result<()> {
+    let output = crate::tmux::tmux_query_command()
+        .args(["kill-session", "-t", session_id])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let absent = crate::tmux::tmux_no_server_running(&output.stderr)
+        || stderr
+            .lines()
+            .any(|line| line.trim().starts_with("can't find session"));
+    if !output.status.success() && !absent {
+        bail!("Failed to kill tmux session {session_id}: {stderr}");
+    }
+    Ok(())
+}
+
 /// Retire independent terminals even when tool ownership cannot be settled.
 pub(crate) fn kill_ancillary_sessions_for_id(id: &str) -> Result<()> {
     use crate::tmux::{
