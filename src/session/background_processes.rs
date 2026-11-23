@@ -122,8 +122,8 @@ fn marked_launch(
 /// marker each process inherited (`processes` from
 /// [`crate::containers::process_census::read`]). The current launch's tree is read as on the
 /// host, from its exec root (the member whose parent is outside the container). A member whose
-/// parent isn't a member was left behind by a shell that exited, and is listed with its
-/// subtree, as is each earlier launch's process the restart would otherwise leave running.
+/// parent isn't a member was left behind by a shell that exited, and is listed by itself, as is
+/// the root of each earlier launch's subtree; confirming a root stops its subtree too.
 /// Pids and tokens are the container's own.
 pub(crate) fn container_census(
     processes: &[crate::containers::process_census::ContainerProcess],

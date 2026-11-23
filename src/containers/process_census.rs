@@ -38,8 +38,10 @@ pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// `$1` is the launch's id, `$2` the proc root, then `pid:start` words for the processes of
 /// earlier launches the caller confirmed. Signals every process carrying this launch's marker,
 /// and an earlier launch's only when its pid and start time both still match a word, so a
-/// recycled pid is never signalled. TERM first, KILL for what is left after about 2 s; every
-/// pass reads `/proc` again. Prints `survived <n>`.
+/// recycled pid is never signalled. The words grow to each confirmed process's earlier-marked
+/// descendants before TERM, and again from the survivors before KILL, so a child stays matched
+/// once its parent dies and one forked on TERM is caught. TERM first, KILL for what is left after
+/// about 2 s; every pass reads `/proc` again. Prints `survived <n>`.
 pub(crate) const STOP_SCRIPT: &str = r#"l=$1 r=$2
 shift 2
 pairs=" $* "
@@ -47,6 +49,24 @@ st() {
   s=$(cat "$r/$1/stat" 2>/dev/null) || return 1
   set -- ${s##*") "}
   [ "$1" != Z ] && [ "$1" != X ] && printf '%s' "${20}"
+}
+expand() {
+  g=1
+  while [ -n "$g" ]; do
+    g=
+    for d in "$r"/[0-9]*; do
+      p=${d##*/}
+      grep -qzxF -- "AOE_SESSION_SOURCE=$l" "$d/environ" 2>/dev/null && continue
+      grep -qz -- '^AOE_SESSION_SOURCE=' "$d/environ" 2>/dev/null || continue
+      s=$(cat "$d/stat" 2>/dev/null) || continue
+      set -- ${s##*") "}
+      [ "$1" != Z ] && [ "$1" != X ] || continue
+      q=$2 t=${20}
+      case $pairs in *" $p:$t "*) continue ;; esac
+      u=$(st "$q") || continue
+      case $pairs in *" $q:$u "*) pairs="$pairs$p:$t " g=1 ;; esac
+    done
+  done
 }
 pick() {
   for d in "$r"/[0-9]*; do
@@ -66,9 +86,11 @@ wait_gone() {
     i=$((i + 1))
   done
 }
+expand
 v=$(pick)
 [ -n "$v" ] && kill -TERM $v 2>/dev/null
 wait_gone 10
+expand
 v=$(pick)
 [ -n "$v" ] && kill -KILL $v 2>/dev/null
 wait_gone 5
@@ -422,49 +444,125 @@ mod tests {
         }
     }
 
-    /// The stop, on real processes: the script's proc root holds only this test's children, so
+    /// Kills on drop what a stop test started, so a failed assertion leaves nothing running:
+    /// its direct children and, by pid, the descendants they reported.
+    struct Started {
+        children: Vec<(&'static str, std::process::Child)>,
+        descendants: Vec<u32>,
+    }
+
+    impl Drop for Started {
+        fn drop(&mut self) {
+            for &pid in &self.descendants {
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid as i32),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+            }
+            for (_, child) in &mut self.children {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn spawn_marked(argv: &[&str], marker: Option<&str>) -> std::process::Child {
+        let mut command = std::process::Command::new(argv[0]);
+        command.args(&argv[1..]).env_remove("AOE_SESSION_SOURCE");
+        if let Some(marker) = marker {
+            command.env("AOE_SESSION_SOURCE", marker);
+        }
+        command.spawn().unwrap()
+    }
+
+    fn start_of(pid: u32) -> u64 {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let rest = stat.rsplit_once(") ").unwrap().1;
+        rest.split_whitespace().nth(19).unwrap().parse().unwrap()
+    }
+
+    /// Alive and not a zombie: the stop script's own test of a process it still has to stop.
+    fn running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            !matches!(
+                stat.rsplit_once(") ")
+                    .and_then(|(_, rest)| rest.split_whitespace().next()),
+                Some("Z" | "X")
+            )
+        })
+    }
+
+    /// Waits for a pid a shell wrote to `file` and, given `program`, for that process to run it.
+    fn reported_pid(file: &std::path::Path, program: Option<&[u8]>) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .filter(|pid| {
+                    program.is_none_or(|program| {
+                        std::fs::read(format!("/proc/{pid}/cmdline"))
+                            .is_ok_and(|cmdline| cmdline.starts_with(program))
+                    })
+                })
+            {
+                return pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{file:?} never named a {program:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The stop, on real processes: the script's proc root holds only this test's processes, so
     /// nothing else on the machine is read or signalled. This launch's go, a TERM-ignoring one
-    /// by KILL; an earlier launch's only when its pid and start both match a confirmed word.
+    /// by KILL; an earlier launch's only when its pid and start both match a confirmed word, and
+    /// then with its children, a TERM-ignoring one by KILL after its parent died.
     #[cfg(target_os = "linux")]
     #[test]
     fn the_stop_takes_this_launch_and_only_the_confirmed_earlier_processes() {
         use std::os::unix::process::ExitStatusExt;
 
-        struct Children(Vec<(&'static str, std::process::Child)>);
-        impl Drop for Children {
-            fn drop(&mut self) {
-                for (_, child) in &mut self.0 {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-            }
-        }
         let current = uuid::Uuid::new_v4().to_string();
         let earlier = uuid::Uuid::new_v4().to_string();
-        let spawn = |argv: &[&str], marker: Option<&str>| {
-            let mut command = std::process::Command::new(argv[0]);
-            command.args(&argv[1..]).env_remove("AOE_SESSION_SOURCE");
-            if let Some(marker) = marker {
-                command.env("AOE_SESSION_SOURCE", marker);
-            }
-            command.spawn().unwrap()
+        let files = tempfile::tempdir().unwrap();
+        let with_child = |name: &str| {
+            let file = files.path().join(name);
+            let script = format!(
+                "sh -c \"trap '' TERM; exec sleep 600\" & echo $! > '{}'; wait",
+                file.display()
+            );
+            (file, spawn_marked(&["sh", "-c", &script], Some(&earlier)))
         };
         let sleep = ["sleep", "600"];
-        let mut children = Children(vec![
-            ("current", spawn(&sleep, Some(&current))),
-            (
-                "ignores TERM",
-                spawn(
-                    &["sh", "-c", "trap '' TERM; exec sleep 600"],
-                    Some(&current),
+        let (confirmed_child_file, confirmed_parent) = with_child("confirmed");
+        let (unconfirmed_child_file, unconfirmed_parent) = with_child("unconfirmed");
+        let mut started = Started {
+            children: vec![
+                ("current", spawn_marked(&sleep, Some(&current))),
+                (
+                    "ignores TERM",
+                    spawn_marked(
+                        &["sh", "-c", "trap '' TERM; exec sleep 600"],
+                        Some(&current),
+                    ),
                 ),
-            ),
-            ("earlier, confirmed", spawn(&sleep, Some(&earlier))),
-            ("earlier, unconfirmed", spawn(&sleep, Some(&earlier))),
-            ("earlier, pid reused", spawn(&sleep, Some(&earlier))),
-            ("unmarked", spawn(&sleep, None)),
-        ]);
-        let pid = |index: usize| children.0[index].1.id();
+                ("earlier, confirmed", spawn_marked(&sleep, Some(&earlier))),
+                ("earlier, unconfirmed", spawn_marked(&sleep, Some(&earlier))),
+                ("earlier, pid reused", spawn_marked(&sleep, Some(&earlier))),
+                ("unmarked", spawn_marked(&sleep, None)),
+                ("earlier, confirmed, with a child", confirmed_parent),
+                ("earlier, unconfirmed, with a child", unconfirmed_parent),
+            ],
+            descendants: Vec::new(),
+        };
+        let confirmed_child = reported_pid(&confirmed_child_file, Some(b"sleep"));
+        started.descendants.push(confirmed_child);
+        let unconfirmed_child = reported_pid(&unconfirmed_child_file, Some(b"sleep"));
+        started.descendants.push(unconfirmed_child);
+        let pid = |index: usize| started.children[index].1.id();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !std::fs::read(format!("/proc/{}/cmdline", pid(1)))
             .unwrap()
@@ -473,26 +571,21 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "the trap never ran");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let start = |pid: u32| -> u64 {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-            let rest = stat.rsplit_once(") ").unwrap().1;
-            rest.split_whitespace().nth(19).unwrap().parse().unwrap()
-        };
         let root = tempfile::tempdir().unwrap();
-        for index in 0..children.0.len() {
-            std::os::unix::fs::symlink(
-                format!("/proc/{}", pid(index)),
-                root.path().join(pid(index).to_string()),
-            )
-            .unwrap();
+        let mut pids: Vec<u32> = (0..started.children.len()).map(pid).collect();
+        pids.extend([confirmed_child, unconfirmed_child]);
+        for pid in pids {
+            std::os::unix::fs::symlink(format!("/proc/{pid}"), root.path().join(pid.to_string()))
+                .unwrap();
         }
-        let confirmed = format!("{}:{}", pid(2), start(pid(2)));
-        let reused = format!("{}:{}", pid(4), start(pid(4)) + 1);
+        let confirmed = format!("{}:{}", pid(2), start_of(pid(2)));
+        let reused = format!("{}:{}", pid(4), start_of(pid(4)) + 1);
+        let with_a_child = format!("{}:{}", pid(6), start_of(pid(6)));
 
         let output = std::process::Command::new("/bin/sh")
             .args(["-c", STOP_SCRIPT, "sh", &current])
             .arg(root.path())
-            .args([&confirmed, &reused])
+            .args([&confirmed, &reused, &with_a_child])
             .env_remove("AOE_SESSION_SOURCE")
             .output()
             .unwrap();
@@ -501,24 +594,94 @@ mod tests {
             "survived 0\n",
             "{output:?}"
         );
-        let outcomes: Vec<_> = children
-            .0
+        let outcomes: Vec<_> = started
+            .children
             .iter_mut()
             .map(|(name, child)| {
                 let status = child.try_wait().unwrap();
                 (*name, status.map(|status| status.signal()))
             })
             .collect();
+        // (each direct child's exit signal, whether each one's own child still runs)
         assert_eq!(
-            outcomes,
-            [
-                ("current", Some(Some(15))),
-                ("ignores TERM", Some(Some(9))),
-                ("earlier, confirmed", Some(Some(15))),
-                ("earlier, unconfirmed", None),
-                ("earlier, pid reused", None),
-                ("unmarked", None),
-            ]
+            (
+                outcomes,
+                running(confirmed_child),
+                running(unconfirmed_child)
+            ),
+            (
+                vec![
+                    ("current", Some(Some(15))),
+                    ("ignores TERM", Some(Some(9))),
+                    ("earlier, confirmed", Some(Some(15))),
+                    ("earlier, unconfirmed", None),
+                    ("earlier, pid reused", None),
+                    ("unmarked", None),
+                    ("earlier, confirmed, with a child", Some(Some(15))),
+                    ("earlier, unconfirmed, with a child", None),
+                ],
+                false,
+                true
+            )
+        );
+    }
+
+    /// A confirmed earlier process that forks on TERM: the child appears only after the stop
+    /// began, so it is caught by the second expansion before KILL. The trap links the child into
+    /// the script's proc root itself, so the root still holds only this test's processes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stop_catches_a_child_a_confirmed_process_forks_on_term() {
+        let current = uuid::Uuid::new_v4().to_string();
+        let earlier = uuid::Uuid::new_v4().to_string();
+        let files = tempfile::tempdir().unwrap();
+        let file = files.path().join("forked");
+        let ready = files.path().join("ready");
+        let root = tempfile::tempdir().unwrap();
+        let script = format!(
+            "trap 'sleep 600 & c=$!; ln -s /proc/$c \"{root}/$c\"; echo $c > \"{file}\"' TERM; \
+             : > \"{ready}\"; while :; do sleep 0.1; done",
+            root = root.path().display(),
+            file = file.display(),
+            ready = ready.display()
+        );
+        let mut started = Started {
+            children: vec![(
+                "forks on TERM",
+                spawn_marked(&["sh", "-c", &script], Some(&earlier)),
+            )],
+            descendants: Vec::new(),
+        };
+        let parent = started.children[0].1.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trap was never set"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::os::unix::fs::symlink(
+            format!("/proc/{parent}"),
+            root.path().join(parent.to_string()),
+        )
+        .unwrap();
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", STOP_SCRIPT, "sh", &current])
+            .arg(root.path())
+            .arg(format!("{parent}:{}", start_of(parent)))
+            .env_remove("AOE_SESSION_SOURCE")
+            .output()
+            .unwrap();
+        let forked = reported_pid(&file, None);
+        started.descendants.push(forked);
+        assert_eq!(
+            (
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                running(forked)
+            ),
+            ("survived 0\n".to_owned(), false),
+            "{output:?}"
         );
     }
 
