@@ -2252,6 +2252,56 @@ mod tests {
             described[1].exe.as_deref(),
             Some(fs::canonicalize(&shell)?.as_path())
         );
+
+        // `true` stays a zombie under a `sleep` that never reaps it, and isn't listed.
+        let reaper = ChildGroup(
+            Command::new("sh")
+                .args(["-c", "(true & exec sleep 700) & wait"])
+                .process_group(0)
+                .spawn()?,
+        );
+        let zombie_under = |parent: u32| {
+            fs::read_dir("/proc")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|entry| {
+                    fs::read_to_string(entry.path().join("stat")).is_ok_and(|stat| {
+                        let mut fields = stat
+                            .rsplit_once(')')
+                            .map_or("", |(_, rest)| rest)
+                            .split_whitespace();
+                        fields.next() == Some("Z") && fields.next() == Some(&parent.to_string())
+                    })
+                })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let described = loop {
+            let described = super::super::process_tree_commands(reaper.0.id())?;
+            let sleep = described
+                .iter()
+                .find(|sample| sample.argv.first().is_some_and(|a| a == "sleep"));
+            if sleep.is_some_and(|sleep| zombie_under(sleep.identity.pid)) {
+                break super::super::process_tree_commands(reaper.0.id())?;
+            }
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "no zombie under the sleep"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let argv: Vec<_> = described.iter().map(|sample| sample.argv.clone()).collect();
+        assert_eq!(
+            argv,
+            [
+                vec![
+                    "sh".to_owned(),
+                    "-c".into(),
+                    "(true & exec sleep 700) & wait".into()
+                ],
+                vec!["sleep".to_owned(), "700".into()],
+            ]
+        );
         Ok(())
     }
 
