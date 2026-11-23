@@ -32,6 +32,85 @@ done
 printf 'end\n'
 "#;
 
+/// Bounds the stop exec: its TERM and KILL waits plus the scans between them.
+pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `$1` is the launch's id, `$2` the proc root, then `pid:start` words for the processes of
+/// earlier launches the caller confirmed. Signals every process carrying this launch's marker,
+/// and an earlier launch's only when its pid and start time both still match a word, so a
+/// recycled pid is never signalled. TERM first, KILL for what is left after about 2 s; every
+/// pass reads `/proc` again. Prints `survived <n>`.
+pub(crate) const STOP_SCRIPT: &str = r#"l=$1 r=$2
+shift 2
+pairs=" $* "
+st() {
+  s=$(cat "$r/$1/stat" 2>/dev/null) || return 1
+  set -- ${s##*") "}
+  [ "$1" != Z ] && [ "$1" != X ] && printf '%s' "${20}"
+}
+pick() {
+  for d in "$r"/[0-9]*; do
+    p=${d##*/}
+    if grep -qzxF -- "AOE_SESSION_SOURCE=$l" "$d/environ" 2>/dev/null; then
+      st "$p" > /dev/null && echo "$p"
+    elif grep -qz -- '^AOE_SESSION_SOURCE=' "$d/environ" 2>/dev/null; then
+      t=$(st "$p") || continue
+      case $pairs in *" $p:$t "*) echo "$p" ;; esac
+    fi
+  done
+}
+wait_gone() {
+  i=0
+  while [ $i -lt "$1" ] && [ -n "$(pick)" ]; do
+    sleep 0.2 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+}
+v=$(pick)
+[ -n "$v" ] && kill -TERM $v 2>/dev/null
+wait_gone 10
+v=$(pick)
+[ -n "$v" ] && kill -KILL $v 2>/dev/null
+wait_gone 5
+n=0
+for p in $(pick); do n=$((n + 1)); done
+printf 'survived %s\n' "$n"
+"#;
+
+/// Stops this launch's processes in the container, and the `earlier` ones (pid and start time,
+/// both the container's) a caller confirmed. An error when the exec fails or any survive.
+pub(crate) fn stop(
+    container: &ContainerExecutionSnapshot,
+    launch_id: &str,
+    earlier: &[(u32, u64)],
+) -> Result<()> {
+    let mut args = ["/bin/sh", "-c", STOP_SCRIPT, "sh", launch_id, "/proc"]
+        .map(String::from)
+        .to_vec();
+    args.extend(earlier.iter().map(|(pid, start)| format!("{pid}:{start}")));
+    let output = container
+        .runtime
+        .exec_output(&container.id, &args, STOP_TIMEOUT)?;
+    ensure!(
+        output.status.success(),
+        "container stop exited {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let survived: usize = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("survived "))
+        .context("container stop gave no count")?
+        .trim()
+        .parse()
+        .context("container stop count")?;
+    ensure!(
+        survived == 0,
+        "{survived} processes of the old launch survived the container stop"
+    );
+    Ok(())
+}
+
 /// Which launch a container process belongs to, by the marker it inherited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Launch {
@@ -127,6 +206,54 @@ fn parse(output: &str) -> Result<Vec<ContainerProcess>> {
         });
     }
     bail!("container census ended early")
+}
+
+/// A runtime program for tests: it writes its argv, NUL-separated, to `dir/argv`, then runs
+/// `tail` as shell with the same arguments.
+#[cfg(test)]
+pub(crate) fn fake_container(
+    dir: &std::path::Path,
+    name: &str,
+    tail: &str,
+) -> ContainerExecutionSnapshot {
+    use std::os::unix::fs::PermissionsExt;
+
+    let program = dir.join(name);
+    std::fs::write(
+        &program,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{}'\n{tail}\n",
+            dir.join("argv").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    ContainerExecutionSnapshot {
+        runtime: super::RuntimeExecutionSnapshot {
+            kind: crate::session::ContainerRuntimeName::Docker,
+            program,
+            cwd: dir.to_path_buf(),
+            endpoint: String::new(),
+            local_mounts: true,
+            routing: Vec::new(),
+            global_arguments: Vec::new(),
+        },
+        name: "aoe-test".into(),
+        id: "container-id".into(),
+        mounts: Vec::new(),
+        shadow_mounts: Vec::new(),
+    }
+}
+
+/// The argv [`fake_container`] last recorded in `dir`.
+#[cfg(test)]
+pub(crate) fn recorded_argv(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read(dir.join("argv"))
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect()
 }
 
 #[cfg(test)]
@@ -256,8 +383,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_census_execs_the_constant_script_with_the_launch_as_an_argument() {
-        use std::os::unix::fs::PermissionsExt;
-
         let proc = FakeProc::new("1000.00");
         proc.process(
             60,
@@ -268,34 +393,7 @@ mod tests {
             &["AOE_SESSION_SOURCE=launch-2"],
         );
         let bin = tempfile::tempdir().unwrap();
-        let recorded = bin.path().join("argv");
-        let container = |name: &str, tail: &str| {
-            let program = bin.path().join(name);
-            std::fs::write(
-                &program,
-                format!(
-                    "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > '{}'\n{tail}\n",
-                    recorded.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-            ContainerExecutionSnapshot {
-                runtime: super::super::RuntimeExecutionSnapshot {
-                    kind: crate::session::ContainerRuntimeName::Docker,
-                    program,
-                    cwd: bin.path().to_path_buf(),
-                    endpoint: String::new(),
-                    local_mounts: true,
-                    routing: Vec::new(),
-                    global_arguments: Vec::new(),
-                },
-                name: "aoe-test".into(),
-                id: "container-id".into(),
-                mounts: Vec::new(),
-                shadow_mounts: Vec::new(),
-            }
-        };
+        let container = |name: &str, tail: &str| fake_container(bin.path(), name, tail);
         let runs = container(
             "runs",
             &format!("shift 2\nexec \"$@\" '{}'", proc.0.path().display()),
@@ -305,8 +403,6 @@ mod tests {
             found.iter().map(|p| (p.pid, p.launch)).collect::<Vec<_>>(),
             [(60, Launch::Current)]
         );
-        let argv = std::fs::read(&recorded).unwrap();
-        let argv: Vec<_> = argv.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
         let want = [
             "exec",
             "container-id",
@@ -316,13 +412,146 @@ mod tests {
             "sh",
             "launch-2",
         ];
-        assert_eq!(argv, want.map(str::as_bytes));
+        assert_eq!(recorded_argv(bin.path()), want);
 
         for (name, tail) in [
             ("fails", "echo gone >&2; exit 1"),
             ("garbled", "echo garbage"),
         ] {
             assert!(read(&container(name, tail), "launch-2").is_err(), "{name}");
+        }
+    }
+
+    /// The stop, on real processes: the script's proc root holds only this test's children, so
+    /// nothing else on the machine is read or signalled. This launch's go, a TERM-ignoring one
+    /// by KILL; an earlier launch's only when its pid and start both match a confirmed word.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stop_takes_this_launch_and_only_the_confirmed_earlier_processes() {
+        use std::os::unix::process::ExitStatusExt;
+
+        struct Children(Vec<(&'static str, std::process::Child)>);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for (_, child) in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+        let current = uuid::Uuid::new_v4().to_string();
+        let earlier = uuid::Uuid::new_v4().to_string();
+        let spawn = |argv: &[&str], marker: Option<&str>| {
+            let mut command = std::process::Command::new(argv[0]);
+            command.args(&argv[1..]).env_remove("AOE_SESSION_SOURCE");
+            if let Some(marker) = marker {
+                command.env("AOE_SESSION_SOURCE", marker);
+            }
+            command.spawn().unwrap()
+        };
+        let sleep = ["sleep", "600"];
+        let mut children = Children(vec![
+            ("current", spawn(&sleep, Some(&current))),
+            (
+                "ignores TERM",
+                spawn(
+                    &["sh", "-c", "trap '' TERM; exec sleep 600"],
+                    Some(&current),
+                ),
+            ),
+            ("earlier, confirmed", spawn(&sleep, Some(&earlier))),
+            ("earlier, unconfirmed", spawn(&sleep, Some(&earlier))),
+            ("earlier, pid reused", spawn(&sleep, Some(&earlier))),
+            ("unmarked", spawn(&sleep, None)),
+        ]);
+        let pid = |index: usize| children.0[index].1.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !std::fs::read(format!("/proc/{}/cmdline", pid(1)))
+            .unwrap()
+            .starts_with(b"sleep")
+        {
+            assert!(std::time::Instant::now() < deadline, "the trap never ran");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let start = |pid: u32| -> u64 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let rest = stat.rsplit_once(") ").unwrap().1;
+            rest.split_whitespace().nth(19).unwrap().parse().unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..children.0.len() {
+            std::os::unix::fs::symlink(
+                format!("/proc/{}", pid(index)),
+                root.path().join(pid(index).to_string()),
+            )
+            .unwrap();
+        }
+        let confirmed = format!("{}:{}", pid(2), start(pid(2)));
+        let reused = format!("{}:{}", pid(4), start(pid(4)) + 1);
+
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", STOP_SCRIPT, "sh", &current])
+            .arg(root.path())
+            .args([&confirmed, &reused])
+            .env_remove("AOE_SESSION_SOURCE")
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "survived 0\n",
+            "{output:?}"
+        );
+        let outcomes: Vec<_> = children
+            .0
+            .iter_mut()
+            .map(|(name, child)| {
+                let status = child.try_wait().unwrap();
+                (*name, status.map(|status| status.signal()))
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                ("current", Some(Some(15))),
+                ("ignores TERM", Some(Some(9))),
+                ("earlier, confirmed", Some(Some(15))),
+                ("earlier, unconfirmed", None),
+                ("earlier, pid reused", None),
+                ("unmarked", None),
+            ]
+        );
+    }
+
+    /// The host side of the stop: confirmed processes go as `pid:start` words after the
+    /// constant script, and only a reported count of zero is success.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stop_succeeds_only_when_nothing_survives() {
+        let bin = tempfile::tempdir().unwrap();
+        for (name, tail, ok) in [
+            ("stopped", "echo 'survived 0'", true),
+            ("survivor", "echo 'survived 2'", false),
+            ("silent", "true", false),
+            ("fails", "echo 'survived 0'; exit 1", false),
+        ] {
+            let container = fake_container(bin.path(), name, tail);
+            assert_eq!(
+                stop(&container, "launch-2", &[(124, 1240)]).is_ok(),
+                ok,
+                "{name}"
+            );
+            let want = [
+                "exec",
+                "container-id",
+                "/bin/sh",
+                "-c",
+                STOP_SCRIPT,
+                "sh",
+                "launch-2",
+                "/proc",
+                "124:1240",
+            ];
+            assert_eq!(recorded_argv(bin.path()), want, "{name}");
         }
     }
 
