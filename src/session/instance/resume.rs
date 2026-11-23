@@ -689,7 +689,7 @@ impl Instance {
             None
         };
         if restart {
-            self.kill_clean_locked_checked(processes)?;
+            self.kill_for_restart(processes)?;
         }
         if let Some(carry) = conversation_carry {
             self.absorb_published_prime_session(publication);
@@ -1744,6 +1744,102 @@ mod tests {
                 slot.borrow_mut().take();
             });
         }
+    }
+
+    /// A checked sandboxed restart whose container stop fails is a failed launch: the row ends in
+    /// Error, not Starting, and its error names the container and how to stop what is left.
+    #[test]
+    #[serial]
+    fn a_checked_restart_whose_container_stop_fails_ends_in_error_naming_the_remedy() {
+        if !crate::tmux::test_helpers::tmux_available() {
+            return;
+        }
+        let temp = tempdir().unwrap();
+        let _app = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let _env = isolate_resume_environment(temp.path());
+        let runtime = temp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut inst = Instance::new("stop-fails", project.to_str().unwrap());
+        inst.tool = "claude".into();
+        inst.source_profile = "stop-fails".into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        // Every exec fails: the census reads as unclassified, which the restart accepts, and
+        // the stop fails after the pane is gone.
+        inst.active_execution = Some(ActiveExecution {
+            launch_id: "launch-2".into(),
+            binding: crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: "/workspace".into(),
+                cwd_filesystem: "container".into(),
+                filesystem: "container".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: Some(crate::containers::process_census::fake_container(
+                &runtime, "podman", "exit 1",
+            )),
+        });
+        let storage = crate::session::Storage::new_unwatched(&inst.source_profile).unwrap();
+        storage
+            .update(|rows, _| {
+                rows.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+        let mut generation = 0;
+        let admitted =
+            crate::session::background_processes::AdmittedRestart::admit(&mut inst, |row| {
+                generation = row.acquire_lifecycle_reservation(
+                    &storage,
+                    LifecycleOperation::Launch,
+                    Some(Status::Starting),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = inst
+            .finish_reserved_launch(
+                &storage,
+                None,
+                ResumeLaunchOptions {
+                    resume_policy: ResumeAttemptPolicy::Allow,
+                    restart: true,
+                    conversation_carry: None,
+                    processes: Some(crate::session::background_processes::ProcessRecheck {
+                        confirmed: vec![],
+                        stop_unclassified: true,
+                        admitted,
+                    }),
+                },
+                generation,
+                Ok(()),
+            )
+            .unwrap_err();
+        let stored = storage.load().unwrap().remove(0);
+        assert_eq!(stored.status, Status::Error, "{error:#}");
+        assert!(stored.lifecycle_reservation.is_none(), "{error:#}");
+        let message = inst.last_error.clone().unwrap();
+        assert!(
+            message.contains("may still be running in container aoe-test")
+                && message.contains("`podman stop aoe-test`"),
+            "{message}"
+        );
     }
 
     fn isolate_resume_environment(

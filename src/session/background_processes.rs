@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
+
 use crate::process::{CommandSample, PrimeProcessIdentity};
 use crate::session::Instance;
 
@@ -70,6 +72,38 @@ fn container_census_of(instance: &Instance) -> PaneCensus {
             PaneCensus::Unclassified
         }
     }
+}
+
+/// Stops what the Session's current launch runs in its container, which outlives the pane's
+/// runtime client, plus the processes earlier launches left that `confirmed` names. Only this
+/// container's tokens count, by the pid and start time the container itself reported.
+pub(crate) fn stop_container_launch(
+    instance: &Instance,
+    confirmed: &[PrimeProcessIdentity],
+) -> anyhow::Result<()> {
+    let Some((launch_id, container)) = marked_launch(instance) else {
+        return Ok(());
+    };
+    let prefix = format!("container:{}:proc:", container.id);
+    let earlier: Vec<_> = confirmed
+        .iter()
+        .filter_map(|identity| {
+            let start = identity.start_id.strip_prefix(&prefix)?.parse().ok()?;
+            Some((identity.pid, start))
+        })
+        .collect();
+    crate::containers::process_census::stop(container, launch_id, &earlier).with_context(|| {
+        let runtime = container
+            .runtime
+            .program
+            .file_name()
+            .map_or("docker".into(), |name| name.to_string_lossy());
+        let name = &container.name;
+        format!(
+            "the Agent's old processes may still be running in container {name}; restart the \
+             Session to stop them, or stop the container with `{runtime} stop {name}`"
+        )
+    })
 }
 
 /// The launch id the Session's container processes carry, and where the container runs. A

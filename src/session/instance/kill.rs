@@ -157,6 +157,29 @@ impl Instance {
         self.kill_clean_locked_checked(None)
     }
 
+    /// A restart's teardown: the pane, then, in a sandbox, what the launch runs in its container,
+    /// which the pane's runtime client doesn't take with it. A checked restart fails when that
+    /// stop fails, so the new Agent never starts beside the old one; an unchecked one logs it.
+    pub(super) fn kill_for_restart(
+        &self,
+        recheck: Option<&crate::session::background_processes::ProcessRecheck>,
+    ) -> Result<()> {
+        self.kill_clean_locked_checked(recheck)?;
+        if !self.is_sandboxed() {
+            return Ok(());
+        }
+        let confirmed = recheck.map_or(&[][..], |recheck| recheck.confirmed.as_slice());
+        if let Err(error) =
+            crate::session::background_processes::stop_container_launch(self, confirmed)
+        {
+            if recheck.is_some() {
+                return Err(error);
+            }
+            tracing::warn!(target: "session.lifecycle", session = %self.id, error = %format_args!("{error:#}"), "container stop failed before restart");
+        }
+        Ok(())
+    }
+
     /// Stops the pane, first rechecking a restart's confirmed background processes against it:
     /// a refusal returns before anything is torn down.
     pub(super) fn kill_clean_locked_checked(
@@ -585,6 +608,74 @@ impl Instance {
 mod tests {
 
     use super::*;
+
+    /// Katie's call (2026-11-23): every sandboxed restart stops its launch in the container, an
+    /// unchecked one too, with no earlier launch's process named; a failed stop doesn't block
+    /// an unchecked restart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sandboxed_restart_stops_its_own_launch_and_only_confirmed_earlier_processes() {
+        let bin = tempfile::tempdir().unwrap();
+        let mut inst = Instance::new("sandboxed restart", "/tmp/aoe-sandboxed-restart");
+        inst.tool = "claude".into();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            provider: None,
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            before_start_hook_env: Vec::new(),
+            container_workdir: None,
+        });
+        for (name, tail) in [("stops", "echo 'survived 0'"), ("fails", "exit 1")] {
+            inst.active_execution = Some(ActiveExecution {
+                launch_id: "launch-2".into(),
+                binding: crate::session::ExecutionBinding {
+                    agent: "claude".into(),
+                    stores: Vec::new(),
+                    configuration: Vec::new(),
+                    cwd: "/workspace".into(),
+                    cwd_filesystem: "container".into(),
+                    filesystem: "container".into(),
+                    exported_default_store: None,
+                },
+                capture: None,
+                container: Some(crate::containers::process_census::fake_container(
+                    bin.path(),
+                    name,
+                    tail,
+                )),
+            });
+            inst.kill_for_restart(None).unwrap();
+            let argv = crate::containers::process_census::recorded_argv(bin.path());
+            assert_eq!(
+                argv[4..],
+                [
+                    crate::containers::process_census::STOP_SCRIPT,
+                    "sh",
+                    "launch-2",
+                    "/proc"
+                ],
+                "{name}"
+            );
+        }
+        // A confirmed process counts only by a token this container issued.
+        let identity = |pid, start_id: &str| crate::process::PrimeProcessIdentity {
+            pid,
+            start_id: start_id.into(),
+        };
+        let confirmed = [
+            identity(124, "container:container-id:proc:1240"),
+            identity(9, "proc:999"),
+            identity(5, "container:other:proc:5"),
+        ];
+        crate::session::background_processes::stop_container_launch(&inst, &confirmed).unwrap_err();
+        let argv = crate::containers::process_census::recorded_argv(bin.path());
+        assert_eq!(argv[6..], ["launch-2", "/proc", "124:1240"]);
+    }
     #[cfg(target_os = "linux")]
     #[test]
     #[serial_test::serial]
