@@ -16,8 +16,14 @@ fn rooted_pane_census(instance: &Instance) -> (PaneCensus, Option<PrimeProcessId
     let Ok(session) = instance.tmux_session() else {
         return (PaneCensus::Unclassified, None);
     };
+    // A sandboxed pane runs only the runtime's client; its launch runs in the container, and
+    // outlives the client, so the container is read even when the pane is gone.
+    let sandboxed = instance.is_sandboxed();
     // A pane tmux can't classify might be running anything, so it isn't taken for an empty one.
     match crate::tmux::utils::probe_pane(session.name()) {
+        crate::tmux::utils::PaneProbe::Missing if sandboxed => {
+            return (capped_census(container_census_of(instance)), None)
+        }
         crate::tmux::utils::PaneProbe::Missing => {
             return (PaneCensus::Background(Vec::new()), None)
         }
@@ -31,15 +37,122 @@ fn rooted_pane_census(instance: &Instance) -> (PaneCensus, Option<PrimeProcessId
         return (PaneCensus::Unclassified, None);
     };
     let root = tree.first().map(|sample| sample.identity.clone());
-    let launch = AgentLaunch::recorded(
-        instance.launch_executable.as_deref(),
-        instance.launch_resolved_executable.as_deref(),
-    );
-    let census = match census(&tree, &launch, &|arg| canonical(Path::new(arg))) {
+    let census = if sandboxed {
+        container_census_of(instance)
+    } else {
+        let launch = AgentLaunch::recorded(
+            instance.launch_executable.as_deref(),
+            instance.launch_resolved_executable.as_deref(),
+        );
+        census(&tree, &launch, &|arg| canonical(Path::new(arg)))
+    };
+    (capped_census(census), root)
+}
+
+fn capped_census(census: PaneCensus) -> PaneCensus {
+    match census {
         PaneCensus::Background(found) if found.len() > MAX_LISTED => PaneCensus::Unclassified,
         census => census,
+    }
+}
+
+/// The census of a sandboxed Session's container, read through the runtime its launch used.
+fn container_census_of(instance: &Instance) -> PaneCensus {
+    let (Some((launch_id, container)), Some(agent)) =
+        (marked_launch(instance), instance.status_agent())
+    else {
+        return PaneCensus::Unclassified;
     };
-    (census, root)
+    match crate::containers::process_census::read(container, launch_id) {
+        Ok(processes) => container_census(&processes, &container.id, agent.binary),
+        Err(error) => {
+            tracing::warn!(session = %instance.id, %error, "container census failed");
+            PaneCensus::Unclassified
+        }
+    }
+}
+
+/// The launch id the Session's container processes carry, and where the container runs. A
+/// launch without a native execution exports no id and records none, so it has none here.
+fn marked_launch(
+    instance: &Instance,
+) -> Option<(&str, &crate::containers::ContainerExecutionSnapshot)> {
+    let active = instance.active_execution.as_ref()?;
+    Some((active.launch_id.as_str(), active.container.as_ref()?))
+}
+
+/// What a restart would stop or leave in a container besides the Agent, from the launch
+/// marker each process inherited (`processes` from
+/// [`crate::containers::process_census::read`]). The current launch's tree is read as on the
+/// host, from its exec root (the member whose parent is outside the container). A member whose
+/// parent isn't a member was left behind by a shell that exited, and is listed with its
+/// subtree, as is each earlier launch's process the restart would otherwise leave running.
+/// Pids and tokens are the container's own.
+pub(crate) fn container_census(
+    processes: &[crate::containers::process_census::ContainerProcess],
+    container_id: &str,
+    agent_binary: &str,
+) -> PaneCensus {
+    use crate::containers::process_census::Launch;
+
+    let sample = |process: &crate::containers::process_census::ContainerProcess| CommandSample {
+        identity: PrimeProcessIdentity {
+            pid: process.pid,
+            start_id: format!("container:{container_id}:proc:{}", process.start),
+        },
+        parent: process.parent,
+        exe: None,
+        argv: process.argv.clone(),
+        elapsed_secs: process.elapsed_secs,
+    };
+    let members = |launch: Launch| -> Vec<CommandSample> {
+        processes
+            .iter()
+            .filter(|process| process.launch == launch)
+            .map(sample)
+            .collect()
+    };
+    let current = members(Launch::Current);
+    let roots: Vec<_> = current.iter().filter(|s| s.parent == 0).collect();
+    let [root] = roots[..] else {
+        return PaneCensus::Unclassified;
+    };
+    let mut tree = vec![root.clone()];
+    let mut next = 0;
+    while let Some(pid) = tree.get(next).map(|s| s.identity.pid) {
+        next += 1;
+        tree.extend(current.iter().filter(|s| s.parent == pid).cloned());
+    }
+    let is_agent = |s: &CommandSample| {
+        s.argv
+            .first()
+            .is_some_and(|arg0| arg0.rsplit('/').next() == Some(agent_binary))
+    };
+    let PaneCensus::Background(mut found) = census_by(&tree, &is_agent) else {
+        return PaneCensus::Unclassified;
+    };
+    let left_behind = |members: &[CommandSample], earlier: bool| {
+        members
+            .iter()
+            .filter(|s| {
+                s.identity.pid != root.identity.pid
+                    && !members.iter().any(|m| m.identity.pid == s.parent)
+            })
+            .map(|s| BackgroundProcess {
+                identity: s.identity.clone(),
+                command: if is_shell(s) {
+                    named_command(members, s)
+                } else {
+                    program_name(s.argv.first().map_or("", String::as_str))
+                },
+                elapsed_secs: s.elapsed_secs,
+                earlier,
+            })
+            .collect::<Vec<_>>()
+    };
+    found.extend(left_behind(&current, false));
+    found.extend(left_behind(&members(Launch::Earlier), true));
+    PaneCensus::Background(found)
 }
 
 /// The final check, at the pane stop: the refusal when the pane runs something unconfirmed,
@@ -170,6 +283,9 @@ pub(crate) fn refusal(
                     });
                     if index < NAMED {
                         entry["command"] = process.command.clone().into();
+                    }
+                    if process.earlier {
+                        entry["launch"] = "earlier".into();
                     }
                     entry
                 })
@@ -362,6 +478,8 @@ pub(crate) struct BackgroundProcess {
     /// The program's name, with no arguments, so nothing on its command line leaves the host.
     pub command: String,
     pub elapsed_secs: u64,
+    /// Left in the container by an earlier launch of the Session.
+    pub earlier: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -389,6 +507,11 @@ pub(crate) fn census(
                 arg.contains('/') && resolve(arg).is_some_and(|path| launch.matches(&path))
             })
     };
+    census_by(tree, &matches)
+}
+
+/// [`census`], with `matches` telling the Agent's own processes.
+fn census_by(tree: &[CommandSample], matches: &dyn Fn(&CommandSample) -> bool) -> PaneCensus {
     let parent_of = |pid: u32| {
         tree.iter()
             .find(|s| s.identity.pid == pid)
@@ -461,6 +584,7 @@ pub(crate) fn census(
                 identity: shell.identity.clone(),
                 command: named_command(tree, shell),
                 elapsed_secs: shell.elapsed_secs,
+                earlier: false,
             })
             .collect(),
     )
@@ -1040,6 +1164,7 @@ mod tests {
             },
             command: String::new(),
             elapsed_secs: 0,
+            earlier: false,
         };
         let confirmed = [PrimeProcessIdentity {
             pid: 30,
@@ -1158,10 +1283,11 @@ mod tests {
         let widest = BackgroundProcess {
             identity: PrimeProcessIdentity {
                 pid: u32::MAX,
-                start_id: format!("audit:{}", "f".repeat(64)),
+                start_id: format!("container:{}:proc:{}", "f".repeat(64), u64::MAX),
             },
             command: name,
             elapsed_secs: u64::MAX,
+            earlier: true,
         };
         let fields = refusal(PaneCensus::Background(vec![widest; MAX_LISTED]), &[], false).unwrap();
         let mut body = serde_json::json!({
@@ -1175,6 +1301,91 @@ mod tests {
         assert!(size <= 8 * 1024, "{size}");
     }
 
+    /// A sandboxed launch that recorded no execution carries no launch id, so its container
+    /// can't be read for it: the census refuses rather than reading the container as empty.
+    #[test]
+    fn a_sandboxed_launch_without_an_execution_is_unclassified() {
+        let mut row = Instance::new("sandboxed", "/tmp/aoe-census-no-execution");
+        row.tool = "claude".into();
+        assert!(row.active_execution.is_none());
+        assert_eq!(container_census_of(&row), PaneCensus::Unclassified);
+    }
+
+    /// Katie's probe (2026-11-23): a container where the restart's pane kill would leave the
+    /// launch running. Membership is by marker, so processes reparented to the container's init
+    /// are still the launch's.
+    #[test]
+    fn a_container_lists_what_its_launches_left_by_marker_not_by_tree() {
+        use crate::containers::process_census::{ContainerProcess, Launch};
+        let process = |pid, parent, launch, argv: &[&str]| ContainerProcess {
+            pid,
+            parent,
+            start: u64::from(pid) * 10,
+            elapsed_secs: 5,
+            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+            launch,
+        };
+        let init = process(1, 0, Launch::Unmarked, &["sleep", "infinity"]);
+        let agent = process(
+            60,
+            0,
+            Launch::Current,
+            &["/usr/local/bin/claude", "--resume"],
+        );
+        let mcp = process(61, 60, Launch::Current, &["node", "mcp.js"]);
+        let shell = process(62, 60, Launch::Current, &["/bin/bash", "-c", "npm run dev"]);
+        let npm = process(63, 62, Launch::Current, &["npm", "run", "dev"]);
+        let sleep = process(64, 1, Launch::Current, &["sleep", "600"]);
+        let orphan_shell = process(65, 1, Launch::Current, &["bash"]);
+        let under_orphan = process(66, 65, Launch::Current, &["node", "server.js"]);
+        let old_agent = process(124, 1, Launch::Earlier, &["claude", "--session-id", "x"]);
+        let old_child = process(125, 124, Launch::Earlier, &["node", "mcp.js"]);
+        let terminal = process(70, 0, Launch::Unmarked, &["/bin/bash"]);
+        let listed = |processes: &[&ContainerProcess]| {
+            let processes: Vec<_> = processes.iter().map(|p| (*p).clone()).collect();
+            match container_census(&processes, "abc", "claude") {
+                PaneCensus::Background(found) => Some(
+                    found
+                        .into_iter()
+                        .map(|p| (p.identity.pid, p.identity.start_id, p.command, p.earlier))
+                        .collect::<Vec<_>>(),
+                ),
+                PaneCensus::Unclassified => None,
+            }
+        };
+        let all = [
+            &init,
+            &agent,
+            &mcp,
+            &shell,
+            &npm,
+            &sleep,
+            &orphan_shell,
+            &under_orphan,
+            &old_agent,
+            &old_child,
+            &terminal,
+        ];
+        let token = |pid: u32| format!("container:abc:proc:{}", pid * 10);
+        assert_eq!(
+            listed(&all),
+            Some(vec![
+                (62, token(62), "npm".into(), false),
+                (64, token(64), "sleep".into(), false),
+                (65, token(65), "node".into(), false),
+                (124, token(124), "claude".into(), true),
+            ])
+        );
+        // Without a current exec root nothing can be attributed, nor with two.
+        let second_root = process(80, 0, Launch::Current, &["claude"]);
+        for processes in [
+            &[&init, &sleep, &old_agent][..],
+            &[&agent, &second_root][..],
+        ] {
+            assert_eq!(listed(processes), None, "{processes:?}");
+        }
+    }
+
     #[test]
     fn a_restart_goes_ahead_once_everything_found_is_confirmed() {
         let found = |pid| BackgroundProcess {
@@ -1184,6 +1395,7 @@ mod tests {
             },
             command: "sleep".into(),
             elapsed_secs: 7,
+            earlier: false,
         };
         let all: Vec<_> = (1..=7).map(found).collect();
         let ids: Vec<_> = all.iter().map(|p| p.identity.clone()).collect();
