@@ -169,7 +169,7 @@ pub(crate) fn refusal(
                         "elapsed_secs": process.elapsed_secs,
                     });
                     if index < NAMED {
-                        entry["argv"] = shown_argv(&process.argv).into();
+                        entry["command"] = process.command.clone().into();
                     }
                     entry
                 })
@@ -302,9 +302,8 @@ const NAMED: usize = 5;
 /// More background shells than this are reported as unclassified, so the refusal stays within
 /// the client's 8 KiB error body.
 const MAX_LISTED: usize = 24;
+/// A shown program name's size in bytes.
 const ARG_CAP: usize = 256;
-/// A shown command line's size as JSON.
-const ARGV_CAP: usize = 768;
 const SHELLS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "ksh"];
 
 /// Where the Agent's own process can be recognised: the files its launch resolved to, and the
@@ -360,7 +359,8 @@ fn package_root(file: &Path) -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackgroundProcess {
     pub identity: PrimeProcessIdentity,
-    pub argv: Vec<String>,
+    /// The program's name, with no arguments, so nothing on its command line leaves the host.
+    pub command: String,
     pub elapsed_secs: u64,
 }
 
@@ -445,7 +445,7 @@ pub(crate) fn census(
             .filter(|sample| agent.contains(&sample.parent) && is_shell(sample))
             .map(|shell| BackgroundProcess {
                 identity: shell.identity.clone(),
-                argv: named_command(tree, shell),
+                command: named_command(tree, shell),
                 elapsed_secs: shell.elapsed_secs,
             })
             .collect(),
@@ -475,44 +475,39 @@ fn is_shell(sample: &CommandSample) -> bool {
         || sample.argv.first().is_some_and(|arg0| name(arg0))
 }
 
-/// What `shell` runs: its first descendant that isn't another shell, or else the program the
-/// shell was given. A `-c` script is never shown: it is one argument, so a secret inside it
-/// can't be blanked.
-fn named_command(tree: &[CommandSample], shell: &CommandSample) -> Vec<String> {
+/// What `shell` runs, by program name: its first descendant that isn't another shell, else the
+/// program inside Claude Code's Bash wrapper, else the shell itself.
+fn named_command(tree: &[CommandSample], shell: &CommandSample) -> String {
     let mut level = vec![shell.identity.pid];
     while !level.is_empty() {
         let children: Vec<_> = tree.iter().filter(|s| level.contains(&s.parent)).collect();
         if let Some(command) = children.iter().find(|child| !is_shell(child)) {
-            return command.argv.clone();
+            return program_name(command.argv.first().map_or("", String::as_str));
         }
         level = children.iter().map(|child| child.identity.pid).collect();
     }
-    wrapped_command(&shell.argv).unwrap_or_else(|| {
-        let script_flag = shell
-            .argv
-            .iter()
-            .skip(1)
-            .position(|arg| runs_command(shell, arg));
-        match script_flag {
-            Some(at) => {
-                let mut shown = shell.argv[..at + 1].to_vec();
-                shown.push(
-                    shell.argv[at + 1]
-                        .split_once('=')
-                        .map_or(shell.argv[at + 1].as_str(), |(flag, _)| flag)
-                        .to_owned(),
-                );
-                shown
-            }
-            None => shell.argv.clone(),
-        }
-    })
+    wrapped_command(&shell.argv)
+        .unwrap_or_else(|| program_name(shell.argv.first().map_or("", String::as_str)))
+}
+
+/// The basename of `argv0`'s first word, since a process can rewrite its `argv[0]` into a title
+/// such as `tool --token=x`, with control characters replaced and its length capped.
+fn program_name(argv0: &str) -> String {
+    let word = argv0.split_whitespace().next().unwrap_or_default();
+    let name: String = word
+        .rsplit('/')
+        .next()
+        .unwrap_or(word)
+        .chars()
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect();
+    capped(&name, ARG_CAP)
 }
 
 /// The program inside Claude Code's Bash wrapper, `bash -c "source <snapshot> ... && eval
 /// '<command>' < /dev/null ..."`: its first word past any `NAME=value` and `env` prefix, and
-/// only when that word reads exactly as written, since nothing after it is shown.
-fn wrapped_command(argv: &[String]) -> Option<Vec<String>> {
+/// only when that word reads exactly as written.
+fn wrapped_command(argv: &[String]) -> Option<String> {
     if !argv.iter().any(|arg| arg == "-c") {
         return None;
     }
@@ -538,7 +533,7 @@ fn wrapped_command(argv: &[String]) -> Option<Vec<String>> {
         if after_env && word.starts_with('-') {
             return None;
         }
-        return Some(vec![word.to_owned()]);
+        return Some(program_name(word));
     }
     None
 }
@@ -583,158 +578,6 @@ pub(crate) fn unacknowledged(
         .collect()
 }
 
-/// `argv` as it may leave the host: credentials blanked (see `redacted`), control characters
-/// replaced, each argument and the whole line capped.
-pub(crate) fn shown_argv(argv: &[String]) -> Vec<String> {
-    let mut shown = Vec::new();
-    let mut size = 2;
-    let mut hide = Hide::Nothing;
-    for arg in argv {
-        let arg: String = redacted(arg, &mut hide)
-            .0
-            .chars()
-            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-            .collect();
-        let arg = capped(&arg, ARG_CAP);
-        size += serde_json::to_string(&arg).map_or(usize::MAX, |json| json.len()) + 1;
-        if size > ARGV_CAP {
-            break;
-        }
-        shown.push(arg);
-    }
-    shown
-}
-
-const REDACTED: &str = "***";
-
-/// What a flag hides of the argument after it.
-#[derive(Clone, Copy)]
-enum Hide {
-    Nothing,
-    /// The whole value of a secret flag (`--token abc`).
-    Value,
-    /// The password of a `user:password` value (`curl -u`).
-    Password,
-}
-
-/// `arg` with its credentials blanked, and whether it held one: the value after a secret flag,
-/// of a secret variable or header (`Authorization: Bearer …`), and a URL's or `--user`'s
-/// password. `hide` carries a secret flag over to the argument after it.
-fn redacted(arg: &str, hide: &mut Hide) -> (String, bool) {
-    match std::mem::replace(hide, Hide::Nothing) {
-        Hide::Value => return (REDACTED.to_owned(), true),
-        Hide::Password => {
-            if let Some((user, _)) = arg.split_once(':') {
-                return (format!("{user}:{REDACTED}"), true);
-            }
-        }
-        Hide::Nothing => {}
-    }
-    if let Some((name, _)) = arg
-        .split_once(':')
-        .filter(|(name, _)| !name.contains(char::is_whitespace) && secret_name(name))
-    {
-        return (format!("{name}: {REDACTED}"), true);
-    }
-    if arg.contains(char::is_whitespace) {
-        // Several words in one argument: a rewritten title, or a value with spaces. Where a
-        // secret's value ends is unknown, so nothing after a word that held one is shown.
-        let mut words = Vec::new();
-        let mut rest = arg.split_whitespace().peekable();
-        while let Some(word) = rest.next() {
-            let (shown, secret) = redacted(word, hide);
-            let hides_rest = shown.ends_with(REDACTED);
-            words.push(shown);
-            if secret {
-                if !hides_rest && rest.peek().is_some() {
-                    words.push(REDACTED.to_owned());
-                }
-                return (words.join(" "), true);
-            }
-        }
-        return (words.join(" "), false);
-    }
-    let (arg, url_password) = without_url_password(arg);
-    if let Some((name, _)) = arg.split_once('=').filter(|(name, _)| secret_name(name)) {
-        return (format!("{name}={REDACTED}"), true);
-    }
-    // A `user:password` value attached to its flag (`--user=admin:pw`, `-uadmin:pw`).
-    if let Some((flag, user)) = ["--user=", "--proxy-user=", "-u"].iter().find_map(|flag| {
-        let (user, _) = arg.strip_prefix(flag)?.split_once(':')?;
-        Some((flag, user))
-    }) {
-        return (format!("{flag}{user}:{REDACTED}"), true);
-    }
-    if arg.starts_with('-') && secret_name(&arg) {
-        *hide = Hide::Value;
-    } else if matches!(arg.as_str(), "-u" | "--user" | "--proxy-user") {
-        *hide = Hide::Password;
-    }
-    (arg, url_password)
-}
-
-/// `arg` with the password of any URL in it (`scheme://user:password@host`) blanked, and whether
-/// it had one. A `@` later in the argument can only blank more than the password, never less.
-fn without_url_password(arg: &str) -> (String, bool) {
-    let mut shown = String::new();
-    let mut found = false;
-    let mut rest = arg;
-    while let Some(at) = rest.find("://") {
-        let (head, tail) = rest.split_at(at + 3);
-        shown.push_str(head);
-        rest = tail;
-        if let Some((user, info)) = tail
-            .rsplit_once('@')
-            .and_then(|(info, _)| Some((info.split_once(':')?.0, info)))
-        {
-            shown.push_str(&format!("{user}:{REDACTED}"));
-            rest = &tail[info.len()..];
-            found = true;
-        }
-    }
-    shown.push_str(rest);
-    (shown, found)
-}
-
-/// A flag (`--api-key`), variable (`GITHUB_TOKEN`) or header (`Authorization`) whose value is a
-/// credential.
-fn secret_name(name: &str) -> bool {
-    let name = name
-        .trim_start_matches('-')
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    const EXACT: &[&str] = &[
-        "token",
-        "password",
-        "passwd",
-        "pass",
-        "passphrase",
-        "secret",
-        "auth",
-        "authorization",
-        "apikey",
-        "key",
-        "bearer",
-        "credential",
-        "credentials",
-        "cookie",
-    ];
-    const SUFFIXES: &[&str] = &[
-        "_token",
-        "_key",
-        "_secret",
-        "_password",
-        "_passwd",
-        "_passphrase",
-        "_auth",
-        "_authorization",
-        "_credential",
-        "_credentials",
-        "_cookie",
-    ];
-    EXACT.contains(&name.as_str()) || SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
-}
-
 fn capped(arg: &str, cap: usize) -> String {
     if arg.len() <= cap {
         return arg.to_owned();
@@ -763,10 +606,10 @@ mod tests {
         }
     }
 
-    fn named(census: PaneCensus) -> Option<Vec<Vec<String>>> {
+    fn named(census: PaneCensus) -> Option<Vec<String>> {
         match census {
             PaneCensus::Unclassified => None,
-            PaneCensus::Background(found) => Some(found.into_iter().map(|p| p.argv).collect()),
+            PaneCensus::Background(found) => Some(found.into_iter().map(|p| p.command).collect()),
         }
     }
 
@@ -843,7 +686,7 @@ mod tests {
         };
         let npm = sample(31, 30, "/usr/bin/node", &["npm", "run", "dev"]);
         let esbuild = sample(32, 31, "/opt/esbuild", &["esbuild", "--watch"]);
-        let cases: Vec<(&str, &AgentLaunch, Vec<CommandSample>, Option<Vec<&[&str]>>)> = vec![
+        let cases: Vec<(&str, &AgentLaunch, Vec<CommandSample>, Option<Vec<&str>>)> = vec![
             (
                 "login shell, native claude, a dev server: one entry",
                 &claude,
@@ -854,7 +697,7 @@ mod tests {
                     npm.clone(),
                     esbuild.clone(),
                 ],
-                Some(vec![&["npm", "run", "dev"]]),
+                Some(vec!["npm"]),
             ),
             (
                 "an updated binary still runs from its recorded path",
@@ -863,7 +706,7 @@ mod tests {
                     sample(20, 1, "/opt/claude/versions/2.1.0", &["claude"]),
                     dev_shell(20),
                 ],
-                Some(vec![&["npm"]]),
+                Some(vec!["npm"]),
             ),
             (
                 "a login shell whose -c names the Agent is not the Agent",
@@ -880,7 +723,7 @@ mod tests {
                     dev_shell(20),
                     npm.clone(),
                 ],
-                Some(vec![&["npm", "run", "dev"]]),
+                Some(vec!["npm"]),
             ),
             (
                 // macOS reads arguments whole or not at all; without them nothing is named.
@@ -927,7 +770,7 @@ mod tests {
                     sample(22, 20, "/usr/bin/bash", &["bash", "-lc", "sleep 600"]),
                     sample(23, 22, "/usr/bin/sleep", &["sleep", "600"]),
                 ],
-                Some(vec![&["sleep", "600"]]),
+                Some(vec!["sleep"]),
             ),
             (
                 "gemini relaunches itself: its shells hang off the child",
@@ -947,7 +790,7 @@ mod tests {
                     sample(22, 21, "/usr/bin/bash", &["bash", "-c", "tail -f log"]),
                     sample(23, 22, "/usr/bin/tail", &["tail", "-f", "log"]),
                 ],
-                Some(vec![&["tail", "-f", "log"]]),
+                Some(vec!["tail"]),
             ),
             (
                 "a launcher beside its Agent and a bundled helper: the Agent's shells",
@@ -964,13 +807,13 @@ mod tests {
                     ]
                     .concat(),
                 ),
-                Some(vec![&["tail", "-f", "log"]]),
+                Some(vec!["tail"]),
             ),
             (
                 "shells on both the launcher and its Agent",
                 &gemini,
                 gemini_launcher([agent_tail(), vec![dev_shell(20), npm.clone()]].concat()),
-                Some(vec![&["tail", "-f", "log"], &["npm", "run", "dev"]]),
+                Some(vec!["tail", "npm"]),
             ),
             (
                 "a launcher beside an unmatched branch running a shell: unclassified",
@@ -1011,7 +854,7 @@ mod tests {
                     ),
                     sample(22, 21, "/usr/bin/sleep", &["sleep", "600"]),
                 ],
-                Some(vec![&["sleep", "600"]]),
+                Some(vec!["sleep"]),
             ),
             (
                 "two background shells",
@@ -1027,7 +870,7 @@ mod tests {
                         &["bash", "-c", "while :; do :; done"],
                     ),
                 ],
-                Some(vec![&["npm", "run", "dev"], &["bash", "-c"]]),
+                Some(vec!["npm", "bash"]),
             ),
             (
                 "a bundled helper and a nested copy don't move the Agent",
@@ -1054,7 +897,7 @@ mod tests {
                     ),
                     sample(24, 20, "/bin/busybox", &["sh", "-c", "sleep 9"]),
                 ],
-                Some(vec![&["codex", "exec", "x"], &["sh", "-c"]]),
+                Some(vec!["codex", "sh"]),
             ),
             (
                 "no Agent process in the pane",
@@ -1074,12 +917,8 @@ mod tests {
             ),
         ];
         for (name, launch, tree, expected) in cases {
-            let expected = expected.map(|entries| {
-                entries
-                    .into_iter()
-                    .map(|argv| argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
-                    .collect::<Vec<_>>()
-            });
+            let expected =
+                expected.map(|names| names.into_iter().map(str::to_owned).collect::<Vec<_>>());
             assert_eq!(named(census(&tree, launch, &resolve)), expected, "{name}");
         }
     }
@@ -1092,7 +931,7 @@ mod tests {
             } >/dev/null 2>&1 || true && eval 'grep -c '\"'\"'a b'\"'\"' log' < /dev/null \
             && pwd -P >| /tmp/claude-4d4e-cwd";
         for (argv, named) in [
-            (vec!["/bin/bash", "-c", captured], Some(vec!["grep"])),
+            (vec!["/bin/bash", "-c", captured], Some("grep")),
             (
                 vec![
                     "bash",
@@ -1100,7 +939,7 @@ mod tests {
                     "-l",
                     "source /tmp/snap && eval 'npm run dev' < /dev/null",
                 ],
-                Some(vec!["npm"]),
+                Some("npm"),
             ),
             (vec!["bash", "-c", "sleep 600"], None),
             (vec!["bash", "script.sh"], None),
@@ -1109,15 +948,14 @@ mod tests {
                 None,
             ),
             (vec!["bash", "-c", "source /tmp/snap && eval ''"], None),
-            // The first word can carry a secret itself, so assignments go and an inexact word
-            // isn't shown.
+            // Assignments and `env` before the program go, and an inexact word names nothing.
             (
                 vec!["bash", "-c", "source /s && eval 'TOKEN=abc cli --token x'"],
-                Some(vec!["cli"]),
+                Some("cli"),
             ),
             (
                 vec!["bash", "-c", "source /s && eval 'env API_KEY=x A=1 cli'"],
-                Some(vec!["cli"]),
+                Some("cli"),
             ),
             (vec!["bash", "-c", "source /s && eval 'env -i cli'"], None),
             (
@@ -1129,8 +967,7 @@ mod tests {
             (vec!["bash", "-c", "source /s && eval '\"cli\" x'"], None),
         ] {
             let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
-            let named = named.map(|words| words.iter().map(|w| w.to_string()).collect::<Vec<_>>());
-            assert_eq!(wrapped_command(&argv), named, "{argv:?}");
+            assert_eq!(wrapped_command(&argv).as_deref(), named, "{argv:?}");
         }
         let shell = sample(
             30,
@@ -1138,91 +975,17 @@ mod tests {
             "/usr/bin/bash",
             &["bash", "-c", "-l", "source /s && eval 'make watch'"],
         );
-        assert_eq!(
-            named_command(std::slice::from_ref(&shell), &shell),
-            ["make"]
-        );
-        // A shell left at a builtin shows no script, however it was given.
-        for (argv, shown) in [
-            (
-                &["bash", "-c", "cli --token abc; read -r"][..],
-                &["bash", "-c"][..],
-            ),
-            (
-                &["bash", "-lc", "cli --token abc; read -r"],
-                &["bash", "-lc"],
-            ),
-            (
-                &["bash", "--norc", "-c", "x", "arg0", "--token", "y"],
-                &["bash", "--norc", "-c"],
-            ),
-            (
-                &["bash", "script.sh", "--token", "y"],
-                &["bash", "script.sh", "--token", "y"],
-            ),
-            (
-                &["fish", "--command", "cli --token abc; read"],
-                &["fish", "--command"],
-            ),
-            (
-                &["fish", "--command=cli --token abc; read"],
-                &["fish", "--command"],
-            ),
-            (
-                &["fish", "--no-config", "--command=cli --token abc"],
-                &["fish", "--no-config", "--command"],
-            ),
+        assert_eq!(named_command(std::slice::from_ref(&shell), &shell), "make");
+        // A shell left at a builtin is named by itself, never by its script or arguments.
+        for argv in [
+            &["bash", "-c", "cli --token abc; read -r"][..],
+            &["/bin/bash", "--norc", "-c", "x", "arg0", "--token", "y"],
+            &["bash", "script.sh", "--token", "y"],
+            &["fish", "--command=cli --token abc; read"],
         ] {
-            let plain = sample(31, 20, &format!("/usr/bin/{}", argv[0]), argv);
-            assert_eq!(
-                named_command(std::slice::from_ref(&plain), &plain),
-                shown,
-                "{argv:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn no_part_of_a_spaced_secret_leaves_the_host() {
-        let eval = r#"source /s && eval 'cli --token "alpha beta"' < /dev/null"#;
-        let exact = sample(31, 30, "/usr/bin/cli", &["cli", "--password", "alpha beta"]);
-        for (tree, shown) in [
-            (
-                vec![sample(30, 20, "/usr/bin/bash", &["bash", "-c", eval])],
-                &["cli"][..],
-            ),
-            (
-                vec![sample(
-                    30,
-                    20,
-                    "/usr/bin/bash",
-                    &["bash", "-c", r#"cli --password "alpha beta""#],
-                )],
-                &["bash", "-c"],
-            ),
-            (
-                vec![sample(
-                    30,
-                    20,
-                    "/usr/bin/bash",
-                    &["bash", "-lc", r#"cli --token "alpha beta"; read -r"#],
-                )],
-                &["bash", "-lc"],
-            ),
-            // Arguments read whole keep the value as one, so it is blanked whole.
-            (
-                vec![sample(30, 20, "/usr/bin/bash", &["bash", "-c", "x"]), exact],
-                &["cli", "--password", "***"],
-            ),
-        ] {
-            let named = shown_argv(&named_command(&tree, &tree[0]));
-            assert!(
-                !named
-                    .iter()
-                    .any(|arg| arg.contains("alpha") || arg.contains("beta")),
-                "{named:?}"
-            );
-            assert_eq!(named, shown);
+            let plain = sample(31, 20, "/usr/bin/bash", argv);
+            let name = named_command(std::slice::from_ref(&plain), &plain);
+            assert_eq!(name, argv[0].rsplit('/').next().unwrap(), "{argv:?}");
         }
     }
 
@@ -1233,7 +996,7 @@ mod tests {
                 pid,
                 start_id: start.into(),
             },
-            argv: vec![],
+            command: String::new(),
             elapsed_secs: 0,
         };
         let confirmed = [PrimeProcessIdentity {
@@ -1268,10 +1031,7 @@ mod tests {
         assert_eq!(fields["classified"], true);
         assert_eq!(fields["total"], 1);
         assert_eq!(fields["processes"][0]["pid"], 22);
-        assert_eq!(
-            fields["processes"][0]["argv"],
-            serde_json::json!(["tail", "-f", "log"])
-        );
+        assert_eq!(fields["processes"][0]["command"], serde_json::json!("tail"));
         assert_eq!(
             refusal(census(&listed, &gemini_launch(), &resolve), &[shell], false),
             None
@@ -1285,156 +1045,80 @@ mod tests {
         );
     }
 
+    /// #5858 (option B): a refusal names each process by its program alone, so no secret on a
+    /// command line can leave the host, whether a flag, a query string or a bare argument.
     #[test]
-    fn secret_values_are_blanked_before_a_command_line_leaves_the_host() {
-        for (argv, shown) in [
-            (&["npm", "run", "dev"][..], &["npm", "run", "dev"][..]),
+    fn no_argument_leaves_the_host_in_a_refusal() {
+        let wrapped = "source /s && eval 'tool s3cretE' < /dev/null";
+        let rows: [(&str, Vec<CommandSample>, &str); 5] = [
             (
-                &["cli", "--token", "abc", "next"],
-                &["cli", "--token", "***", "next"],
-            ),
-            (&["cli", "--token=abc"], &["cli", "--token=***"]),
-            (&["cli", "--token=alpha beta"], &["cli", "--token=***"]),
-            (
-                &["env", "API_KEY=alpha beta", "node"],
-                &["env", "API_KEY=***", "node"],
-            ),
-            (&["cli", "--password", "pw"], &["cli", "--password", "***"]),
-            (
-                &["cli", "--api-key", "k", "--verbose"],
-                &["cli", "--api-key", "***", "--verbose"],
+                "s3cretA",
+                vec![sample(
+                    31,
+                    30,
+                    "/usr/bin/tool",
+                    &["/usr/bin/tool", "--authtoken", "s3cretA"],
+                )],
+                "tool",
             ),
             (
-                &["cli", "--client-secret=s"],
-                &["cli", "--client-secret=***"],
+                "s3cretB",
+                vec![sample(
+                    31,
+                    30,
+                    "/usr/bin/curl",
+                    &["curl", "https://h/x?access_token=s3cretB"],
+                )],
+                "curl",
             ),
             (
-                &["env", "OPENAI_API_KEY=sk-1", "node"],
-                &["env", "OPENAI_API_KEY=***", "node"],
+                "s3cretC",
+                vec![sample(31, 30, "/usr/bin/tool", &["tool", "s3cretC"])],
+                "tool",
             ),
             (
-                &["env", "GITHUB_TOKEN=x", "PASSWORD=y"],
-                &["env", "GITHUB_TOKEN=***", "PASSWORD=***"],
+                "s3cretD",
+                vec![sample(31, 30, "/usr/bin/tool", &["tool --token=s3cretD"])],
+                "tool",
             ),
-            (
-                &["gpg", "--passphrase", "p"],
-                &["gpg", "--passphrase", "***"],
-            ),
-            (&["cli", "--key", "k"], &["cli", "--key", "***"]),
-            (&["cli", "--bearer=b"], &["cli", "--bearer=***"]),
-            // A header, a `--user` password and a URL's password.
-            (
-                &["curl", "-H", "Authorization: Bearer abc", "-u", "admin:pw"],
-                &["curl", "-H", "Authorization: ***", "-u", "admin:***"],
-            ),
-            (
-                &["curl", "--user=admin:pw", "-uadmin:pw", "--proxy-user=p:x"],
-                &[
-                    "curl",
-                    "--user=admin:***",
-                    "-uadmin:***",
-                    "--proxy-user=p:***",
+            ("s3cretE", vec![], "tool"),
+        ];
+        let mut leaks = Vec::new();
+        for (secret, under_shell, want) in rows {
+            let script = if under_shell.is_empty() { wrapped } else { "x" };
+            let tree = [
+                vec![
+                    sample(20, 1, "/opt/claude/versions/2.1.0", &["claude"]),
+                    sample(30, 20, "/usr/bin/bash", &["bash", "-c", script]),
                 ],
-            ),
-            (
-                &["curl", "-H", "X-Api-Key:k"],
-                &["curl", "-H", "X-Api-Key: ***"],
-            ),
-            (
-                &[
-                    "psql",
-                    "postgres://user:pw@db/app",
-                    "DATABASE_URL=mysql://u:p@h",
-                ],
-                &[
-                    "psql",
-                    "postgres://user:***@db/app",
-                    "DATABASE_URL=mysql://u:***@h",
-                ],
-            ),
-            (
-                &["curl", "--user=admin:top secret", "-uadmin:top secret"],
-                &["curl", "--user=admin:***", "-uadmin:***"],
-            ),
-            // A process that rewrote its title reports its words as one argument. Nothing after a
-            // blanked word is shown, since the value may hold spaces.
-            (
-                &["node server.js --token=alpha beta --verbose"],
-                &["node server.js --token=***"],
-            ),
-            (
-                &["node server.js --token alpha beta -H Authorization: Bearer x"],
-                &["node server.js --token ***"],
-            ),
-            (
-                &["worker -H Authorization: Bearer x"],
-                &["worker -H Authorization: ***"],
-            ),
-            (
-                &["sync postgres://u:pw@db/app --verbose"],
-                &["sync postgres://u:***@db/app ***"],
-            ),
-            // A word that only reads like a blank isn't a credential: the rest is shown.
-            (
-                &["grep -c *** log --verbose"],
-                &["grep -c *** log --verbose"],
-            ),
-            // A value that already reads `***` is still a value: the rest stays hidden.
-            (&["cli", "--token=*** beta"], &["cli", "--token=***"]),
-            (
-                &["curl", "--user=admin:*** secret"],
-                &["curl", "--user=admin:***"],
-            ),
-            (&["curl", "-uadmin:*** secret"], &["curl", "-uadmin:***"]),
-            (
-                &["node app --token *** remaining"],
-                &["node app --token ***"],
-            ),
-            (
-                &["sync postgres://u:***@db/app secret"],
-                &["sync postgres://u:***@db/app ***"],
-            ),
-            (
-                &["node server.js --port 3000"],
-                &["node server.js --port 3000"],
-            ),
-            // Not secrets: a key-like word that isn't a flag, a path, `-p` (a port or a prompt), a
-            // URL without a password, a `-u` that takes no pair.
-            (
-                &["cli", "token", "keys.json"],
-                &["cli", "token", "keys.json"],
-            ),
-            (
-                &["curl", "https://example.com/a@b", "localhost:3000"],
-                &["curl", "https://example.com/a@b", "localhost:3000"],
-            ),
-            (&["python", "-u", "app.py"], &["python", "-u", "app.py"]),
-            (
-                &["ssh", "-p", "22", "--keyfile=/k"],
-                &["ssh", "-p", "22", "--keyfile=/k"],
-            ),
-            (&["vite", "--port=5173"], &["vite", "--port=5173"]),
-        ] {
-            let argv: Vec<String> = argv.iter().map(|arg| arg.to_string()).collect();
-            assert_eq!(shown_argv(&argv), shown, "{argv:?}");
+                under_shell,
+            ]
+            .concat();
+            let claude = AgentLaunch {
+                files: vec!["/opt/claude/versions/2.1.0".into()],
+                dirs: vec![],
+            };
+            let fields = refusal(census(&tree, &claude, &resolve), &[], false).unwrap();
+            let shown = serde_json::to_string(&fields).unwrap();
+            if shown.contains(secret) || fields["processes"][0]["command"] != want {
+                leaks.push(format!("{secret}: {shown}"));
+            }
         }
+        assert!(leaks.is_empty(), "{leaks:#?}");
     }
 
     #[test]
     fn the_widest_refusal_fits_the_clients_error_body() {
-        let quotes = "\"".repeat(400);
-        let control = "\u{1b}[2J".repeat(100);
-        let shown = shown_argv(&[control, quotes.clone(), "x".into(), quotes]);
-        assert!(shown.iter().all(|arg| arg.len() <= ARG_CAP));
-        assert!(!shown.iter().any(|arg| arg.contains('\u{1b}')), "{shown:?}");
-        assert!(serde_json::to_string(&shown).unwrap().len() <= ARGV_CAP);
+        let name = program_name(&format!("/x/{}", "\u{1b}\"".repeat(400)));
+        assert!(name.len() <= ARG_CAP, "{}", name.len());
+        assert!(!name.contains('\u{1b}'), "{name:?}");
 
         let widest = BackgroundProcess {
             identity: PrimeProcessIdentity {
                 pid: u32::MAX,
                 start_id: format!("audit:{}", "f".repeat(64)),
             },
-            argv: vec!["\"".into(); 4096],
+            command: name,
             elapsed_secs: u64::MAX,
         };
         let fields = refusal(PaneCensus::Background(vec![widest; MAX_LISTED]), &[], false).unwrap();
@@ -1456,7 +1140,7 @@ mod tests {
                 pid,
                 start_id: format!("proc:{pid}"),
             },
-            argv: vec!["sleep".into(), pid.to_string()],
+            command: "sleep".into(),
             elapsed_secs: 7,
         };
         let all: Vec<_> = (1..=7).map(found).collect();
@@ -1465,11 +1149,11 @@ mod tests {
         assert_eq!(listed["total"], 7);
         assert_eq!(listed["processes"].as_array().unwrap().len(), 7);
         assert_eq!(
-            listed["processes"][4]["argv"],
-            serde_json::json!(["sleep", "5"])
+            listed["processes"][4]["command"],
+            serde_json::json!("sleep")
         );
         assert!(
-            listed["processes"][5].get("argv").is_none(),
+            listed["processes"][5].get("command").is_none(),
             "only the first 5 are named"
         );
         assert_eq!(listed["processes"][6]["start_id"], "proc:7");

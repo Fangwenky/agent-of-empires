@@ -10241,10 +10241,7 @@ async fn a_launchers_agent_shell_is_named_beside_its_bundled_helper() {
     assert_eq!(body["error"], "background_processes");
     assert_eq!(body["classified"], true);
     assert_eq!(body["total"], 1);
-    assert_eq!(
-        body["processes"][0]["argv"],
-        serde_json::json!(["sleep", "600"])
-    );
+    assert_eq!(body["processes"][0]["command"], "sleep");
     assert_eq!(sleeping_in(&pane, 1), 1, "a refusal stops nothing");
 }
 
@@ -10373,9 +10370,10 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     assert_eq!(first["launch_hooks_ran"], false);
     assert_eq!(first["classified"], true);
     assert_eq!(first["total"], 1);
-    assert_eq!(
-        first["processes"][0]["argv"],
-        serde_json::json!(["sleep", "600"])
+    assert_eq!(first["processes"][0]["command"], "sleep");
+    assert!(
+        !first.to_string().contains("\"600\""),
+        "no argument leaves the host: {first}"
     );
     assert!(first["processes"][0]["elapsed_secs"].as_u64().unwrap() < 60);
     assert_eq!(sleeping(1), 1, "a refusal stops nothing");
@@ -10386,19 +10384,13 @@ async fn an_update_restart_names_the_agents_background_shells_before_stopping_th
     let (status, refreshed) = restart(&inst, identities(&first), false).await;
     assert_eq!(status, StatusCode::CONFLICT, "{refreshed}");
     assert_eq!(refreshed["total"], 2);
-    let argv: Vec<_> = refreshed["processes"]
+    let commands: Vec<_> = refreshed["processes"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|entry| entry["argv"].clone())
+        .map(|entry| entry["command"].clone())
         .collect();
-    assert_eq!(
-        argv,
-        [
-            serde_json::json!(["sleep", "600"]),
-            serde_json::json!(["sleep", "700"])
-        ]
-    );
+    assert_eq!(commands, ["sleep", "sleep"]);
 
     // A pane tmux doesn't answer for might run anything, so even the right list is refused.
     let timeout = crate::tmux::TmuxTimeoutGuard::arm(&pane);

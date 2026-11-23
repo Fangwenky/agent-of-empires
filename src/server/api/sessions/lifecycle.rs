@@ -2247,7 +2247,7 @@ fn background_processes_response(
     let code = crate::daemon::ApiErrorCode::BackgroundProcesses;
     let mut payload = serde_json::json!({
         "error": code.as_str(),
-        "message": "The restart would stop background processes that were not confirmed",
+        "message": "The restart would stop background processes that were not confirmed; they are listed by program name and PID",
         "launch_hooks_ran": launch_hooks_ran,
     });
     if let (Some(payload), serde_json::Value::Object(fields)) = (payload.as_object_mut(), fields) {
