@@ -437,7 +437,21 @@ pub(crate) fn census(
                 !agent.contains(&c.identity.pid) && !is_shell(c) && runs_a_shell(c.identity.pid)
             })
     });
-    if ambiguous {
+    // A non-shell match the walk above didn't reach, with no shell between it and the
+    // outermost: a process the Agent doesn't own (a shim such as `timeout`) stands between them,
+    // so whose shells are whose can't be told. A matched shell is a shell the Agent runs.
+    let stranded = matched.iter().filter(|m| !is_shell(m)).any(|m| {
+        let mut pid = m.identity.pid;
+        while !agent.contains(&pid) {
+            match tree.iter().find(|s| s.identity.pid == pid) {
+                Some(s) if s.identity.pid != m.identity.pid && is_shell(s) => return false,
+                Some(s) if s.parent != pid => pid = s.parent,
+                _ => return true,
+            }
+        }
+        pid != m.identity.pid
+    });
+    if ambiguous || stranded {
         return PaneCensus::Unclassified;
     }
     PaneCensus::Background(
@@ -898,6 +912,34 @@ mod tests {
                     sample(24, 20, "/bin/busybox", &["sh", "-c", "sleep 9"]),
                 ],
                 Some(vec!["codex", "sh"]),
+            ),
+            (
+                "a shim between the launcher and the Agent: unclassified",
+                &claude,
+                vec![
+                    sample(20, 1, "/opt/claude/versions/2.1.0", &["claude"]),
+                    sample(
+                        21,
+                        20,
+                        "/usr/bin/timeout",
+                        &["timeout", "900", "/opt/claude/versions/2.1.0"],
+                    ),
+                    sample(22, 21, "/opt/claude/versions/2.1.0", &["claude"]),
+                    sample(23, 22, "/usr/bin/bash", &["bash", "-c", "sleep 600"]),
+                    sample(24, 23, "/usr/bin/sleep", &["sleep", "600"]),
+                ],
+                None,
+            ),
+            (
+                "a copy a shell runs under a relaunched Agent stays the shell's",
+                &claude,
+                vec![
+                    sample(20, 1, "/opt/claude/versions/2.1.0", &["claude"]),
+                    sample(21, 20, "/opt/claude/versions/2.1.0", &["claude"]),
+                    sample(22, 21, "/usr/bin/bash", &["bash", "-c", "claude -p x"]),
+                    sample(23, 22, "/opt/claude/versions/2.1.0", &["claude", "-p", "x"]),
+                ],
+                Some(vec!["claude"]),
             ),
             (
                 "no Agent process in the pane",

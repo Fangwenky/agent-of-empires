@@ -10125,6 +10125,111 @@ fn sleeping_in(pane: &str, count: usize) -> usize {
     }
 }
 
+/// #5858: an Agent that reaches its real self through a shim that isn't a shell, such as
+/// `timeout`, can't have its shells told apart, so the restart refuses as unclassified. A copy
+/// a shell runs is still that shell's.
+#[tokio::test]
+#[serial_test::serial]
+async fn an_agent_behind_a_non_shell_shim_refuses_as_unclassified() {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
+        eprintln!("tmux not available; skipping");
+        return;
+    }
+    let Ok(system_timeout) = which::which("timeout") else {
+        eprintln!("timeout not on PATH (macOS has no GNU timeout); skipping");
+        return;
+    };
+    let _home = crate::session::test_support::isolate_app_dir();
+    let project = tempfile::tempdir().unwrap();
+    // A copy, so the system `timeout` doesn't match; named `timeout`, so a multi-call
+    // coreutils still runs it as `timeout`.
+    let bin = std::fs::canonicalize(project.path()).unwrap().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let agent = bin.join("timeout");
+    std::fs::copy(std::fs::canonicalize(&system_timeout).unwrap(), &agent).unwrap();
+    let agent = agent.to_str().unwrap().to_owned();
+    // `timeout` outlives a hung-up pane, so each case's tree is stopped here.
+    struct StopTree(u32);
+    impl Drop for StopTree {
+        fn drop(&mut self) {
+            if let Ok(tree) = crate::process::process_tree_commands(self.0) {
+                for sample in tree {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &sample.identity.pid.to_string()])
+                        .status();
+                }
+            }
+        }
+    }
+    for (case, command, classified, total) in [
+        (
+            "the Agent behind a shim",
+            format!("{agent} 900 timeout 900 {agent} 900 bash -c 'sleep 600; :'"),
+            false,
+            0,
+        ),
+        (
+            "a copy a shell runs",
+            format!("{agent} 900 bash -c '{agent} 900 sleep 600; :'"),
+            true,
+            1,
+        ),
+    ] {
+        let mut inst = make_test_instance();
+        inst.source_profile = "default".to_string();
+        inst.project_path = project.path().to_str().unwrap().to_owned();
+        inst.status = Status::Idle;
+        inst.launch_executable = Some(agent.clone().into());
+        inst.launch_resolved_executable = Some(agent.clone().into());
+        let pane = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &pane, &command])
+            .status();
+        if !created.map(|status| status.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        let _pane_guard = crate::tmux::test_helpers::TmuxTestSession::from_name(pane.clone());
+        crate::tmux::refresh_session_cache();
+        let _stop = StopTree(pane_pid(&pane));
+        assert_eq!(sleeping_in(&pane, 1), 1, "{case}");
+        Storage::new_unwatched("default")
+            .unwrap()
+            .update(|rows, _| {
+                *rows = vec![inst.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![inst.clone()]);
+        crate::server::test_support::refresh_canonical_metadata_for_test(&state).await;
+        let body = crate::daemon::RestartSessionBody {
+            only_if_idle: true,
+            stop_processes: Some(vec![]),
+            ..Default::default()
+        };
+        let response = Box::pin(lifecycle::prepare_agent_session(
+            state,
+            inst.id.clone(),
+            Ok(None),
+            lifecycle::AgentPreparation::Restart,
+            Some(Arc::new(body)),
+        ))
+        .await;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        assert_eq!(status, StatusCode::CONFLICT, "{case}: {body}");
+        assert_eq!(body["classified"], classified, "{case}: {body}");
+        assert_eq!(body["total"], total, "{case}: {body}");
+        if classified {
+            assert_eq!(body["processes"][0]["command"], "timeout", "{case}: {body}");
+        }
+        assert_eq!(sleeping_in(&pane, 1), 1, "{case}: a refusal stops nothing");
+    }
+}
+
 /// #5858: with real processes, a launcher that runs the Agent beside a bundled helper still has
 /// the Agent's shell named before anything is stopped.
 #[tokio::test]
