@@ -2946,6 +2946,13 @@ function AppContent({
                 onAxisChange={setSidebarAxis}
                 suggestions={{
                   readOnly: caps.readOnly || !caps.canManageSuggestions,
+                  cityhall: caps.cityhall,
+                  onEditPreset: caps.canManageSuggestions
+                    ? (providerId, criterion) =>
+                        requestNavigate(
+                          `/settings/suggestions?${new URLSearchParams({ preset_provider: providerId, preset_criterion: criterion })}`,
+                        )
+                    : undefined,
                   onPrepare: (prefill) => {
                     setWizardPrefill(prefill);
                     setShowSessionWizard(true);
