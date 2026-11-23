@@ -1072,7 +1072,7 @@ mod tests {
                             row.try_acquire_lifecycle_reservation(
                                 LifecycleOperation::Launch,
                                 Instance::LIFECYCLE_RESERVATION_TTL,
-                                chrono::Utc::now(),
+                                crate::time::Timestamp::now(),
                             )?;
                             row.unsnooze();
                             row.touch_last_accessed();
@@ -1131,7 +1131,7 @@ mod tests {
                         row.try_acquire_lifecycle_reservation(
                             LifecycleOperation::Launch,
                             Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
+                            crate::time::Timestamp::now(),
                         )?;
                         Ok(())
                     },
@@ -1146,7 +1146,7 @@ mod tests {
                 row.try_acquire_lifecycle_reservation(
                     LifecycleOperation::Launch,
                     Instance::LIFECYCLE_RESERVATION_TTL,
-                    chrono::Utc::now(),
+                    crate::time::Timestamp::now(),
                 )?;
                 row.status = Status::Starting;
                 row.snooze(30);

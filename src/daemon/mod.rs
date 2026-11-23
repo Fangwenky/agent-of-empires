@@ -41,13 +41,14 @@ pub use wire::{
     DeleteProfileQuery, DeleteSessionBody, EmptyTrashBody, EmptyTrashOutcome, EnsureToolBody,
     GroupLocation, GroupSessionFailure, GroupSessionFailureCode, GroupSessionOutcome,
     ListSessionsQuery, MoveDirection, MoveGroupBody, PendingApproval, PlanSummary, ProcessIdentity,
-    PromptAttachmentKind, PromptAttachmentRef, PurgeOutcome, QueuedPromptEntry, RenameOutcome,
-    RenameProfileBody, RenameSessionBody, ReorderBody, ReorderOutcome, RepoBaseInput,
-    RestartForUpdateBody, RestartOutcome, RestartSessionBody, RestoreOutcome, SessionResponse,
-    SessionsEnvelope, SetWorktreeNameBody, StartSessionBody, StopAuxiliaryBody, TerminalSize,
-    TerminalTarget, TerminalTargetStatus, TrashOutcome, TrashRelocationOutcome, TrashSessionBody,
-    Tristate, UpdateArchiveBody, UpdateColorBody, UpdateDiffBaseBody, UpdateFavoriteBody,
-    UpdateGroupBody, UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
+    PromptAttachmentKind, PromptAttachmentRef, PromptOrigin, PurgeOutcome, QueuedPromptEntry,
+    ReclaimOwnershipBody, RenameOutcome, RenameProfileBody, RenameSessionBody, ReorderBody,
+    ReorderOutcome, RepoBaseInput, RestartForUpdateBody, RestartOutcome, RestartSessionBody,
+    RestoreOutcome, SessionResponse, SessionsEnvelope, SetWorktreeNameBody, StartSessionBody,
+    StopAuxiliaryBody, TerminalSize, TerminalTarget, TerminalTargetStatus, TrashOutcome,
+    TrashRelocationOutcome, TrashSessionBody, Tristate, UpdateArchiveBody, UpdateColorBody,
+    UpdateDiffBaseBody, UpdateFavoriteBody, UpdateGroupBody, UpdateIgnoredBody,
+    UpdateNotificationsBody, UpdatePinBody, UpdateSnoozeBody, UpdateUnreadBody,
     WorkspaceRepoSummary, WorktreeEditOutcome,
 };
 pub use wire::{
@@ -57,8 +58,9 @@ pub use wire::{
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Sandbox copies, image pulls and launch hooks can take minutes.
-const LIFECYCLE_TIMEOUT: Duration =
-    Duration::from_secs(crate::session::Instance::SANDBOX_PREPARATION_WINDOW.num_seconds() as u64);
+const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(
+    crate::session::Instance::SANDBOX_PREPARATION_WINDOW.whole_seconds() as u64,
+);
 /// A destroy hook may run for minutes per row, so the bulk purge outlives `DEFAULT_TIMEOUT`.
 const EMPTY_TRASH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
@@ -513,15 +515,17 @@ impl DaemonClient {
         &self,
         body: &CreateSessionBody,
         epoch: &str,
+        origin: PromptOrigin,
     ) -> Result<MutationReceipt<SessionResponse>, DaemonClientError> {
-        self.request_mutation_with_outcome(
-            self.http
-                .post(self.sessions_url.clone())
-                .timeout(Duration::from_secs(30 * 60))
-                .json(body),
-            epoch,
-        )
-        .await
+        let mut request = self
+            .http
+            .post(self.sessions_url.clone())
+            .timeout(Duration::from_secs(30 * 60))
+            .json(body);
+        if let Some(origin) = origin.as_header_value() {
+            request = request.header(PromptOrigin::HEADER, origin);
+        }
+        self.request_mutation_with_outcome(request, epoch).await
     }
 
     /// Request deferred cancellation; the returned cursor confirms the daemon
@@ -1524,7 +1528,10 @@ mod tests {
                 "path": "/tmp", "tool": "claude", "cli": {},
             }))
             .unwrap();
-            let error = client.create_session(&body, "epoch").await.unwrap_err();
+            let error = client
+                .create_session(&body, "epoch", PromptOrigin::Unknown)
+                .await
+                .unwrap_err();
             assert!(matches!(
                 &error,
                 DaemonClientError::Status {

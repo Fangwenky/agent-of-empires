@@ -359,11 +359,11 @@ pub(crate) struct AdmittedRestart {
 #[derive(Debug, Clone, PartialEq)]
 struct Admitted {
     status: crate::session::Status,
-    last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
-    archived_at: Option<chrono::DateTime<chrono::Utc>>,
-    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
-    idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
-    idle_entered_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_accessed_at: Option<crate::time::Timestamp>,
+    archived_at: Option<crate::time::Timestamp>,
+    snoozed_until: Option<crate::time::Timestamp>,
+    idle_dormant_since: Option<crate::time::Timestamp>,
+    idle_entered_at: Option<crate::time::Timestamp>,
 }
 
 impl Admitted {
