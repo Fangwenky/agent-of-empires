@@ -1,6 +1,6 @@
 import type { SessionStatus, Workspace } from "../../lib/types";
 import { getStatusTextClass, isSessionActive } from "../../lib/session";
-import { workspaceAttentionCount } from "../../lib/sidebarSort";
+import { workspaceAttentionCount, workspaceLabel } from "../../lib/sidebarSort";
 import {
   effectiveArchivedOf,
   effectivePinnedOf,
@@ -71,8 +71,7 @@ export function deriveRowModel(
   const runningSession = sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
-  const label =
-    sessions.length === 1 ? sessionTitle || branchLabel || "default" : branchLabel || sessionTitle || "default";
+  const label = workspaceLabel(workspace);
   const sessionColor = sessions.map((s) => s.color).find((c) => c != null) ?? null;
   const isPinned = sessions.some((s) => s.pinned_at != null);
   const isArchived = sessions.some((s) => s.archived_at != null);

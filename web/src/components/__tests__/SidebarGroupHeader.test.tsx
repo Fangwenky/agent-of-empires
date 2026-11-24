@@ -41,7 +41,7 @@ function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
     workspaces: views(workspace("w1", idle(3))),
     status: "idle",
     collapsed: false,
-    capabilities: { appearance: true, reorder: true, create: "repo" },
+    capabilities: { appearance: true, create: "repo" },
     repoPath: "/p",
     registeredProjects: [],
     pinned: false,
@@ -281,7 +281,7 @@ describe("SidebarGroupHeader", () => {
   it("offers 'Edit settings' for the synthetic Scratch group despite capabilities.create being 'generic'", () => {
     const onEditProjectSettings = vi.fn();
     renderHeader({
-      group: group({ id: "__scratch__", capabilities: { appearance: true, reorder: true, create: "generic" } }),
+      group: group({ id: "__scratch__", capabilities: { appearance: true, create: "generic" } }),
       onEditProject: onEditProjectSettings,
     });
 
@@ -292,7 +292,7 @@ describe("SidebarGroupHeader", () => {
 
   it("hides 'Edit settings' for an ordinary unregistered repo group ('generic' create, no repoPath match)", () => {
     renderHeader({
-      group: group({ id: "other", capabilities: { appearance: true, reorder: true, create: "generic" } }),
+      group: group({ id: "other", capabilities: { appearance: true, create: "generic" } }),
       onEditProject: vi.fn(),
     });
 

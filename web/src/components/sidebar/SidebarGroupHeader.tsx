@@ -51,7 +51,7 @@ interface Props {
 export const SidebarGroupHeader = memo(function SidebarGroupHeader(props: Props) {
   const { group, hasActiveChild, onClick, onNewSession, offline, dragHandle, rowsId } = props;
   const pluginAttention = usePluginAttention();
-  // Appearance is repo-axis only; archive-all works on every axis.
+  // Appearance is for repository headers only; archive-all works on every header.
   const canAppearance = group.capabilities.appearance;
   const archivableCount = props.onArchiveAll ? archivableWorkspaces(group).length : 0;
   const canPin = !!props.onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
