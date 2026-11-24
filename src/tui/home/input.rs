@@ -3551,6 +3551,11 @@ impl HomeView {
             ActionId::Tips => self.open_tips_dialog(),
             ActionId::Fork => self.open_fork_from_selection(),
             ActionId::EmptyTrash => self.prompt_empty_trash(),
+            ActionId::ResetCustomOrder => {
+                if let Err(e) = self.reset_custom_order() {
+                    self.info_dialog = Some(InfoDialog::new("Order not reset", &e.to_string()));
+                }
+            }
             ActionId::RestoreTrash => self.restore_selected_from_trash(),
             ActionId::RetryTrash => self.retry_selected_trash(),
             ActionId::AutoName => return self.auto_name_selected(),
@@ -4998,8 +5003,8 @@ impl HomeView {
     /// Follow the Daemon's grouping and sort when a snapshot changes it, unless this view's
     /// own change is still on its way there.
     pub(super) fn adopt_sidebar_view(&mut self, view: crate::session::config::SidebarView) {
-        if self.observed_sidebar_view.replace(view) == Some(view)
-            || self.session_feed.sidebar_view_pending()
+        if self.session_feed.sidebar_view_pending()
+            || self.observed_sidebar_view.replace(view) == Some(view)
             || (view.group_by == self.group_by && view.sort == self.sort_order)
         {
             return;

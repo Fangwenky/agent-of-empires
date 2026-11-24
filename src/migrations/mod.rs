@@ -72,6 +72,7 @@ mod v060_terminal_handoff_outcome;
 mod v061_unpin_default_sandbox_image;
 mod v062_plugin_staging_evidence;
 mod v063_shared_sidebar_view;
+mod v064_shared_custom_order;
 
 /// Fixtures shared by migrations that rewrite agent hook files.
 #[cfg(test)]
@@ -112,7 +113,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 63;
+const CURRENT_VERSION: u32 = 64;
 const VERSION_FILE: &str = ".schema_version";
 
 /// Version, log name, and the one-time transformation to run.
@@ -330,6 +331,7 @@ const MIGRATIONS: &[Migration] = &[
         v062_plugin_staging_evidence::run,
     ),
     (63, "shared_sidebar_view", v063_shared_sidebar_view::run),
+    (64, "shared_custom_order", v064_shared_custom_order::run),
 ];
 
 /// The data-schema version this build targets, i.e. the version every install

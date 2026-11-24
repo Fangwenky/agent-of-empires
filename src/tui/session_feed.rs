@@ -264,9 +264,10 @@ enum CommandRequest {
     Create(Box<CreateSessionBody>),
     Namespace(crate::daemon::NamespaceMutation),
     SidebarView(crate::daemon::SidebarViewPatch),
+    WorkspaceOrdering(crate::daemon::WorkspaceOrderingPatch),
 }
 
-enum PendingSidebarView {
+enum PendingWrite {
     Sent(tokio::sync::oneshot::Receiver<Result<CommandReply, CommandFailure>>),
     Committed(RuntimeCursor),
 }
@@ -302,6 +303,28 @@ impl CapturedRequest {
             })
             .map_err(CommandFailure::Rejected);
         assert!(self.reply.send(reply).is_ok());
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum ViewWrite {
+    Ordering(crate::daemon::WorkspaceOrderingPatch),
+    SidebarView(crate::daemon::SidebarViewPatch),
+}
+#[cfg(test)]
+pub(crate) struct CapturedViewWrite {
+    pub write: ViewWrite,
+    reply: tokio::sync::oneshot::Sender<Result<CommandReply, CommandFailure>>,
+}
+#[cfg(test)]
+impl CapturedViewWrite {
+    pub fn finish(self, result: Result<RuntimeCursor, String>) -> ViewWrite {
+        let reply = result
+            .map(CommandReply::Mutation)
+            .map_err(CommandFailure::Rejected);
+        assert!(self.reply.send(reply).is_ok());
+        self.write
     }
 }
 
@@ -584,6 +607,10 @@ async fn run_queued_command(
                 .set_sidebar_view(&patch, epoch)
                 .await
                 .map(CommandReply::Mutation),
+            CommandRequest::WorkspaceOrdering(patch) => client
+                .set_workspace_ordering(&patch, epoch)
+                .await
+                .map(CommandReply::Mutation),
             CommandRequest::Session { id, request } => match request {
                 SessionRequest::SmartRename => {
                     client
@@ -783,7 +810,8 @@ pub struct SessionFeed {
     pending: HashMap<String, PendingCommand>,
     pending_creations: HashMap<String, PendingCreation>,
     pending_namespace: Option<PendingNamespace>,
-    pending_sidebar_view: Option<PendingSidebarView>,
+    pending_sidebar_view: Option<PendingWrite>,
+    pending_ordering: Option<PendingWrite>,
     namespace_quarantined: bool,
     row_outcomes: Vec<(String, SessionCommandOutcome)>,
     bulk_queue: VecDeque<(String, SessionRequest)>,
@@ -821,6 +849,7 @@ impl SessionFeed {
             pending_creations: HashMap::new(),
             pending_namespace: None,
             pending_sidebar_view: None,
+            pending_ordering: None,
             namespace_quarantined: false,
             row_outcomes: Vec::new(),
             applied: None,
@@ -1126,12 +1155,7 @@ impl SessionFeed {
         Ok(())
     }
 
-    /// Send a sidebar grouping or sort change. Until it resolves, snapshots keep the local
-    /// choice rather than reverting it to the value from before the write.
-    pub(crate) fn submit_sidebar_view(
-        &mut self,
-        patch: crate::daemon::SidebarViewPatch,
-    ) -> anyhow::Result<()> {
+    fn send_view_write(&self, request: CommandRequest) -> anyhow::Result<PendingWrite> {
         let commands = self
             .commands
             .as_ref()
@@ -1139,13 +1163,32 @@ impl SessionFeed {
         let (result, receiver) = tokio::sync::oneshot::channel();
         commands
             .try_send(SessionCommand {
-                request: CommandRequest::SidebarView(patch),
+                request,
                 lease: self.grant.load(Ordering::SeqCst),
                 native: None,
                 result,
             })
             .map_err(|_| anyhow::anyhow!("the runtime command queue is unavailable"))?;
-        self.pending_sidebar_view = Some(PendingSidebarView::Sent(receiver));
+        Ok(PendingWrite::Sent(receiver))
+    }
+
+    /// Send a sidebar grouping or sort change. Until it resolves, snapshots keep the local
+    /// choice rather than reverting it to the value from before the write.
+    pub(crate) fn submit_sidebar_view(
+        &mut self,
+        patch: crate::daemon::SidebarViewPatch,
+    ) -> anyhow::Result<()> {
+        self.pending_sidebar_view = Some(self.send_view_write(CommandRequest::SidebarView(patch))?);
+        Ok(())
+    }
+
+    /// Replace the shared Custom order of rows, of Repository headers, or both.
+    pub(crate) fn submit_workspace_ordering(
+        &mut self,
+        patch: crate::daemon::WorkspaceOrderingPatch,
+    ) -> anyhow::Result<()> {
+        self.pending_ordering =
+            Some(self.send_view_write(CommandRequest::WorkspaceOrdering(patch))?);
         Ok(())
     }
 
@@ -1157,13 +1200,27 @@ impl SessionFeed {
     /// replacement Daemon, is applied, or its failure. `None` while it is in flight or when
     /// none was sent.
     pub(crate) fn drain_sidebar_view_result(&mut self) -> Option<Result<(), String>> {
-        let failure = match self.pending_sidebar_view.as_mut()? {
-            PendingSidebarView::Sent(receiver) => match receiver.try_recv() {
+        let mut slot = self.pending_sidebar_view.take();
+        let result = self.poll_write(&mut slot);
+        self.pending_sidebar_view = slot;
+        result
+    }
+
+    /// [`Self::drain_sidebar_view_result`] for the shared Custom order.
+    pub(crate) fn drain_workspace_ordering_result(&mut self) -> Option<Result<(), String>> {
+        let mut slot = self.pending_ordering.take();
+        let result = self.poll_write(&mut slot);
+        self.pending_ordering = slot;
+        result
+    }
+
+    fn poll_write(&self, slot: &mut Option<PendingWrite>) -> Option<Result<(), String>> {
+        let failure = match slot.as_mut()? {
+            PendingWrite::Sent(receiver) => match receiver.try_recv() {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return None,
                 Ok(Ok(reply)) => {
-                    let cursor = reply.cursor().clone();
-                    self.pending_sidebar_view = Some(PendingSidebarView::Committed(cursor));
-                    return self.drain_sidebar_view_result();
+                    *slot = Some(PendingWrite::Committed(reply.cursor().clone()));
+                    return self.poll_write(slot);
                 }
                 Ok(Err(
                     CommandFailure::Rejected(message)
@@ -1174,21 +1231,20 @@ impl SessionFeed {
                     "the runtime connection closed".to_string()
                 }
             },
-            PendingSidebarView::Committed(cursor) => {
-                let cursor = cursor.clone();
+            PendingWrite::Committed(cursor) => {
                 // A replacement Daemon's snapshot can never confirm the old epoch's receipt.
                 let replaced = self
                     .applied
                     .as_ref()
                     .is_some_and(|snapshot| snapshot.cursor.epoch != cursor.epoch);
-                if !replaced && !self.receipt_applied(&cursor) {
+                if !replaced && !self.receipt_applied(cursor) {
                     return None;
                 }
-                self.pending_sidebar_view = None;
+                *slot = None;
                 return Some(Ok(()));
             }
         };
-        self.pending_sidebar_view = None;
+        *slot = None;
         Some(Err(failure))
     }
 
@@ -2360,6 +2416,28 @@ impl SessionFeed {
         }
     }
 
+    /// Captures shared-order and sidebar-view writes; any other command panics.
+    #[cfg(test)]
+    pub(crate) fn view_write_driver_for_test(
+        &mut self,
+    ) -> impl FnMut() -> Option<CapturedViewWrite> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_CAPACITY);
+        self.commands = Some(sender);
+        set_grant(&self.grant, true);
+        move || {
+            let command = receiver.try_recv().ok()?;
+            let write = match command.request {
+                CommandRequest::WorkspaceOrdering(patch) => ViewWrite::Ordering(patch),
+                CommandRequest::SidebarView(patch) => ViewWrite::SidebarView(patch),
+                _ => panic!("expected a shared-order or sidebar-view write"),
+            };
+            Some(CapturedViewWrite {
+                write,
+                reply: command.result,
+            })
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn namespace_driver_for_test(
         &mut self,
@@ -2463,6 +2541,7 @@ impl SessionFeed {
                 sessions: vec![row],
                 profiles: vec![],
                 workspace_ordering: vec![],
+                repository_order: vec![],
                 global_projects: vec![],
                 sidebar_view: Default::default(),
             },
@@ -3345,6 +3424,7 @@ mod tests {
                 sessions: vec![],
                 profiles: vec![],
                 workspace_ordering: vec![],
+                repository_order: vec![],
                 global_projects: vec![],
                 sidebar_view: Default::default(),
             },
