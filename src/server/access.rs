@@ -1184,7 +1184,7 @@ mod tests {
             let body = if group_request {
                 serde_json::json!({"target":"group","group":{"profile":"default","path":"work"},"direction":"up"})
             } else {
-                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","destination":""})
+                serde_json::json!({"target":"session","id":b.id,"profile":"default","source_group":"work","destination":"","direction":"up"})
             };
             let response = test_support::build_router_for_test(state)
                 .oneshot(
