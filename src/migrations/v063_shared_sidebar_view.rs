@@ -5,8 +5,8 @@
 //! into `group_by` and `sort_order`, a value picked on the web winning, and the removed
 //! choices map to the nearest kept one. A TUI user who never picked a grouping keeps My
 //! groups, the TUI's old default; everyone else gets the new Repository default. The
-//! org and status collapse lists go with their groupings. The web keys stay, since the
-//! dashboard still reads them.
+//! org and status collapse lists go with their groupings. The web keys are left in
+//! `web_ui_state`, unread.
 
 use anyhow::Result;
 use std::path::Path;
